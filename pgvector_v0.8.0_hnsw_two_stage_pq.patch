@@ -1,0 +1,4003 @@
+diff --git a/Makefile b/Makefile
+index 7a4b88c..fbe2f0c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -4,7 +4,7 @@ EXTVERSION = 0.8.0
+ MODULE_big = vector
+ DATA = $(wildcard sql/*--*--*.sql)
+ DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
+-OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
++OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/hnswpq.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+ HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
+ 
+ TESTS = $(wildcard test/sql/*.sql)
+diff --git a/Makefile.win b/Makefile.win
+index 8c62f9d..698f5ea 100644
+--- a/Makefile.win
++++ b/Makefile.win
+@@ -2,7 +2,7 @@ EXTENSION = vector
+ EXTVERSION = 0.8.0
+ 
+ DATA_built = sql\$(EXTENSION)--$(EXTVERSION).sql
+-OBJS = src\bitutils.obj src\bitvec.obj src\halfutils.obj src\halfvec.obj src\hnsw.obj src\hnswbuild.obj src\hnswinsert.obj src\hnswscan.obj src\hnswutils.obj src\hnswvacuum.obj src\ivfbuild.obj src\ivfflat.obj src\ivfinsert.obj src\ivfkmeans.obj src\ivfscan.obj src\ivfutils.obj src\ivfvacuum.obj src\sparsevec.obj src\vector.obj
++OBJS = src\bitutils.obj src\bitvec.obj src\halfutils.obj src\halfvec.obj src\hnsw.obj src\hnswbuild.obj src\hnswinsert.obj src\hnswscan.obj src\hnswutils.obj src\hnswvacuum.obj src\hnswpq.obj src\ivfbuild.obj src\ivfflat.obj src\ivfinsert.obj src\ivfkmeans.obj src\ivfscan.obj src\ivfutils.obj src\ivfvacuum.obj src\sparsevec.obj src\vector.obj
+ HEADERS = src\halfvec.h src\sparsevec.h src\vector.h
+ 
+ REGRESS = bit btree cast copy halfvec hnsw_bit hnsw_halfvec hnsw_sparsevec hnsw_vector ivfflat_bit ivfflat_halfvec ivfflat_vector sparsevec vector_type
+diff --git a/src/hnsw.c b/src/hnsw.c
+index 5bfc619..60c4503 100644
+--- a/src/hnsw.c
++++ b/src/hnsw.c
+@@ -30,6 +30,8 @@ int			hnsw_iterative_scan;
+ int			hnsw_max_scan_tuples;
+ double		hnsw_scan_mem_multiplier;
+ int			hnsw_lock_tranche_id;
++bool		hnsw_candidate_pruning;
++int			hnsw_distance_computation_topk;
+ static relopt_kind hnsw_relopt_kind;
+ 
+ /*
+@@ -74,6 +76,10 @@ HnswInit(void)
+ 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
+ 	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
+ 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
++	add_bool_reloption(hnsw_relopt_kind, "neighbor_metadata", "Whether to store neighbor metadata to estimate distances",
++					   HNSW_DEFAULT_NEIGHBOR_METADATA, AccessExclusiveLock);
++	add_bool_reloption(hnsw_relopt_kind, "enable_compression", "Whether to enable element compression",
++					   HNSW_DEFAULT_ENABLE_COMPRESSION, AccessExclusiveLock);
+ 
+ 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
+ 							"Valid range is 1..1000.", &hnsw_ef_search,
+@@ -93,6 +99,14 @@ HnswInit(void)
+ 							 NULL, &hnsw_scan_mem_multiplier,
+ 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+ 
++	DefineCustomBoolVariable("hnsw.candidate_pruning", "Enables candidate pruning for faster scans",
++							 NULL, &hnsw_candidate_pruning,
++							 HNSW_DEFAULT_CANDIDATE_PRUNING, PGC_USERSET, 0, NULL, NULL, NULL);
++
++	DefineCustomIntVariable("hnsw.distance_computation_topk", "Sets the number of neighbors to compute precise distances when using distance estimation",
++							NULL, &hnsw_distance_computation_topk,
++							HNSW_DEFAULT_DISTANCE_COMPUTATION_TOPK, 1, HNSW_MAX_M * 2, PGC_USERSET, 0, NULL, NULL, NULL);
++
+ 	MarkGUCPrefixReserved("hnsw");
+ }
+ 
+@@ -149,7 +163,7 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 	genericcostestimate(root, path, loop_count, &costs);
+ 
+ 	index = index_open(path->indexinfo->indexoid, NoLock);
+-	HnswGetMetaPageInfo(index, &m, NULL);
++	HnswGetMetaPageInfo(index, &m, NULL, NULL);
+ 	index_close(index, NoLock);
+ 
+ 	/*
+@@ -226,6 +240,8 @@ hnswoptions(Datum reloptions, bool validate)
+ 	static const relopt_parse_elt tab[] = {
+ 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
+ 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
++		{"neighbor_metadata", RELOPT_TYPE_BOOL, offsetof(HnswOptions, neighborMetadata)},
++		{"enable_compression", RELOPT_TYPE_BOOL, offsetof(HnswOptions, enableCompression)},
+ 	};
+ 
+ 	return (bytea *) build_reloptions(reloptions, validate,
+diff --git a/src/hnsw.h b/src/hnsw.h
+index 1fb0c24..0528d1f 100644
+--- a/src/hnsw.h
++++ b/src/hnsw.h
+@@ -37,15 +37,23 @@
+ #define HNSW_MIN_M	2
+ #define HNSW_MAX_M		100
+ #define HNSW_DEFAULT_EF_CONSTRUCTION	64
++#define HNSW_DEFAULT_NEIGHBOR_METADATA	true
++#define HNSW_DEFAULT_ENABLE_COMPRESSION	true
+ #define HNSW_MIN_EF_CONSTRUCTION	4
+ #define HNSW_MAX_EF_CONSTRUCTION		1000
+ #define HNSW_DEFAULT_EF_SEARCH	40
+ #define HNSW_MIN_EF_SEARCH		1
+ #define HNSW_MAX_EF_SEARCH		1000
++#define HNSW_DEFAULT_CANDIDATE_PRUNING			true
++#define HNSW_DEFAULT_DISTANCE_COMPUTATION_TOPK	3
+ 
+ /* Tuple types */
+ #define HNSW_ELEMENT_TUPLE_TYPE  1
+ #define HNSW_NEIGHBOR_TUPLE_TYPE 2
++#define HNSW_CENTROID_TUPLE_TYPE 3
++
++/* Neighbor metadata */
++#define HNSW_NEIGHBOR_METADATA_BYTES	16
+ 
+ /* Make graph robust against non-HOT updates */
+ #define HNSW_HEAPTIDS 10
+@@ -60,8 +68,13 @@
+ #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
+ #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
+ 
++#define HNSW_NEIGHBOR_TUPLE_ENTRY_MAX_SIZE	(sizeof(ItemPointerData) + HNSW_NEIGHBOR_METADATA_BYTES)
++
+ #define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
+-#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
++/* Element PQ: each subvector encoded as 1 byte, so m bytes total (m is the number of subvectors in PQ) */
++#define HNSW_ELEMENT_TUPLE_PQ_COMPRESSED_SIZE(m)	MAXALIGN(offsetof(HnswElementTupleData, data) + (m))
++#define HNSW_NEIGHBOR_TUPLE_ENTRY_SIZE(hasNeighborMetadata)		(sizeof(ItemPointerData) + ((hasNeighborMetadata) ? HNSW_NEIGHBOR_METADATA_BYTES : 0))
++#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m, hasNeighborMetadata)	MAXALIGN(offsetof(HnswNeighborTupleData, entries) + ((level) + 2) * (m) * HNSW_NEIGHBOR_TUPLE_ENTRY_SIZE(hasNeighborMetadata))
+ 
+ #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
+ 
+@@ -86,7 +99,7 @@
+ #define HnswGetMl(m) (1 / log(m))
+ 
+ /* Ensure fits on page and in uint8 */
+-#define HnswGetMaxLevel(m) Min(((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - offsetof(HnswNeighborTupleData, indextids) - sizeof(ItemIdData)) / (sizeof(ItemPointerData)) / (m)) - 2, 255)
++#define HnswGetMaxLevel(m) Min(((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - offsetof(HnswNeighborTupleData, entries) - sizeof(ItemIdData)) / (sizeof(HnswNeighborEntryData)) / (m)) - 2, 255)
+ 
+ #define HnswGetSearchCandidate(membername, ptr) pairingheap_container(HnswSearchCandidate, membername, ptr)
+ #define HnswGetSearchCandidateConst(membername, ptr) pairingheap_const_container(HnswSearchCandidate, membername, ptr)
+@@ -107,12 +120,19 @@
+ #define HnswPtrPointer(hp) (hp).ptr
+ #define HnswPtrOffset(hp) relptr_offset((hp).relptr)
+ 
++/* For neighbor entry access */
++#define HnswNeighborEntryAccess(base, idx, hasNeighborMetadata)	((char *) ((base) + (idx) * HNSW_NEIGHBOR_TUPLE_ENTRY_SIZE(hasNeighborMetadata)))
++#define HnswNeighborEntryItemPointerAccess(base, idx, hasNeighborMetadata)	((ItemPointer) HnswNeighborEntryAccess(base, idx, hasNeighborMetadata))
++#define HnswNeighborEntryMetadataAccess(base, idx, hasNeighborMetadata)		((char *) (HnswNeighborEntryAccess(base, idx, hasNeighborMetadata) + sizeof(ItemPointerData)))
++
+ /* Variables */
+ extern int	hnsw_ef_search;
+ extern int	hnsw_iterative_scan;
+ extern int	hnsw_max_scan_tuples;
+ extern double hnsw_scan_mem_multiplier;
+ extern int	hnsw_lock_tranche_id;
++extern bool hnsw_candidate_pruning;
++extern int	hnsw_distance_computation_topk;
+ 
+ typedef enum HnswIterativeScanMode
+ {
+@@ -158,6 +178,7 @@ typedef HnswElementData * HnswElement;
+ typedef struct HnswCandidate
+ {
+ 	HnswElementPtr element;
++	char		neighborMetadata[HNSW_NEIGHBOR_METADATA_BYTES];
+ 	float		distance;
+ 	bool		closer;
+ }			HnswCandidate;
+@@ -173,16 +194,20 @@ typedef struct HnswSearchCandidate
+ {
+ 	pairingheap_node c_node;
+ 	pairingheap_node w_node;
++	ItemPointerData  indextid;
+ 	HnswElementPtr element;
+-	double		distance;
++	char	neighborMetadata[HNSW_NEIGHBOR_METADATA_BYTES];
++	double	distance;
+ }			HnswSearchCandidate;
+ 
+ /* HNSW index options */
+ typedef struct HnswOptions
+ {
+-	int32		vl_len_;		/* varlena header (do not touch directly!) */
+-	int			m;				/* number of connections */
+-	int			efConstruction; /* size of dynamic candidate list */
++	int32		vl_len_;			/* varlena header (do not touch directly!) */
++	int			m;					/* number of connections */
++	int			efConstruction;		/* size of dynamic candidate list */
++	bool		neighborMetadata;	/* whether to store neighbor metadata to estimate distances */
++	bool		enableCompression;	/* whether to enable element compression */
+ }			HnswOptions;
+ 
+ typedef struct HnswGraph
+@@ -214,6 +239,9 @@ typedef struct HnswShared
+ 	Oid			indexrelid;
+ 	bool		isconcurrent;
+ 
++	/* For PQ state */
++	bool		hasPqState;
++
+ 	/* Worker progress */
+ 	ConditionVariable workersdonecv;
+ 
+@@ -244,12 +272,14 @@ typedef struct HnswAllocator
+ 	void	   *state;
+ }			HnswAllocator;
+ 
+-typedef struct HnswTypeInfo
++typedef struct HnswNeighborEntryData
+ {
+-	int			maxDimensions;
+-	Datum		(*normalize) (PG_FUNCTION_ARGS);
+-	void		(*checkValue) (Pointer v);
+-}			HnswTypeInfo;
++	ItemPointerData	indextid;
++	double			distance;
++	char			metadata[HNSW_NEIGHBOR_METADATA_BYTES];
++}			HnswNeighborEntryData;
++
++typedef HnswNeighborEntryData * HnswNeighborEntry;
+ 
+ typedef struct HnswSupport
+ {
+@@ -258,6 +288,20 @@ typedef struct HnswSupport
+ 	Oid			collation;
+ }			HnswSupport;
+ 
++typedef struct HnswTypeInfo
++{
++	int			maxDimensions;
++	Datum		(*normalize) (PG_FUNCTION_ARGS);
++	void		(*checkValue) (Pointer v);
++	/* For type-specific HNSW graph traversal optimization */
++	bool		pqEnabled;
++	Size		(*itemSize) (int dimensions);
++	void		(*updateCenter) (Pointer v, int dimensions, float *x);
++	void		(*sumCenter) (Pointer v, float *x);
++	void		(*setNeighborMetadata)(char *dst, Datum v, void * pqstate, HnswSupport * support);
++	void		(*estimateDistances)(Datum q, HnswNeighborEntry entries, int *unvisitedIndexes, int count, void * pqstate, HnswSupport * support);
++}			HnswTypeInfo;
++
+ typedef struct HnswQuery
+ {
+ 	Datum		value;
+@@ -276,6 +320,8 @@ typedef struct HnswBuildState
+ 	int			dimensions;
+ 	int			m;
+ 	int			efConstruction;
++	bool		hasNeighborMetadata;
++	bool		enableCompression;
+ 
+ 	/* Statistics */
+ 	double		indtuples;
+@@ -290,6 +336,17 @@ typedef struct HnswBuildState
+ 	double		ml;
+ 	int			maxLevel;
+ 
++	/* PQ state */
++	void	   *pqState;
++	FmgrInfo   *kmeansnormprocinfo;		/* Not used */
++	Oid			collation;				/* Not used */
++
++	/* Sampling */
++	void			   *samples;
++	BlockSamplerData	bs;
++	ReservoirStateData	rstate;
++	int					rowstoskip;
++
+ 	/* Memory */
+ 	MemoryContext graphCtx;
+ 	MemoryContext tmpCtx;
+@@ -301,6 +358,21 @@ typedef struct HnswBuildState
+ 	char	   *hnswarea;
+ }			HnswBuildState;
+ 
++typedef struct HnswPQCodebookPageData
++{
++	BlockNumber	startBlkno;
++	uint16		pageCount;
++	uint16		subvectorDim;
++	uint16		m;
++}			HnswPQCodebookPageData;
++
++typedef struct HnswPQPages
++{
++	bool					hasPqState;
++	HnswPQCodebookPageData	nCodebookPages;
++	HnswPQCodebookPageData	eCodebookPages;
++}			HnswPQPages;
++
+ typedef struct HnswMetaPageData
+ {
+ 	uint32		magicNumber;
+@@ -311,7 +383,14 @@ typedef struct HnswMetaPageData
+ 	BlockNumber entryBlkno;
+ 	OffsetNumber entryOffno;
+ 	int16		entryLevel;
++	char		entryMetadata[HNSW_NEIGHBOR_METADATA_BYTES];
+ 	BlockNumber insertPage;
++
++	/* PQ codebook page information */
++	HnswPQPages pqPages;
++
++	/* Dynamic head page position */
++	BlockNumber headBlkno;
+ }			HnswMetaPageData;
+ 
+ typedef HnswMetaPageData * HnswMetaPage;
+@@ -334,7 +413,8 @@ typedef struct HnswElementTupleData
+ 	ItemPointerData heaptids[HNSW_HEAPTIDS];
+ 	ItemPointerData neighbortid;
+ 	uint16		unused;
+-	Vector		data;
++	/* Variable length data - content depends on PQ state */
++	char		data[FLEXIBLE_ARRAY_MEMBER];
+ }			HnswElementTupleData;
+ 
+ typedef HnswElementTupleData * HnswElementTuple;
+@@ -344,7 +424,7 @@ typedef struct HnswNeighborTupleData
+ 	uint8		type;
+ 	uint8		version;
+ 	uint16		count;
+-	ItemPointerData indextids[FLEXIBLE_ARRAY_MEMBER];
++	char		entries[FLEXIBLE_ARRAY_MEMBER];
+ }			HnswNeighborTupleData;
+ 
+ typedef HnswNeighborTupleData * HnswNeighborTuple;
+@@ -359,7 +439,7 @@ typedef union
+ typedef union
+ {
+ 	HnswElement element;
+-	ItemPointerData indextid;
++	HnswNeighborEntryData entry;
+ }			HnswUnvisited;
+ 
+ typedef struct HnswScanOpaqueData
+@@ -378,6 +458,9 @@ typedef struct HnswScanOpaqueData
+ 
+ 	/* Support functions */
+ 	HnswSupport support;
++
++	/* PQ state */
++	void	   *pqState;
+ }			HnswScanOpaqueData;
+ 
+ typedef HnswScanOpaqueData * HnswScanOpaque;
+@@ -385,6 +468,7 @@ typedef HnswScanOpaqueData * HnswScanOpaque;
+ typedef struct HnswVacuumState
+ {
+ 	/* Info */
++	Relation	heap;
+ 	Relation	index;
+ 	IndexBulkDeleteResult *stats;
+ 	IndexBulkDeleteCallback callback;
+@@ -397,6 +481,9 @@ typedef struct HnswVacuumState
+ 	/* Support functions */
+ 	HnswSupport support;
+ 
++	/* PQ state */
++	void	   *pqState;
++
+ 	/* Variables */
+ 	struct tidhash_hash *deleted;
+ 	BufferAccessStrategy bas;
+@@ -417,29 +504,31 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
+ Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
+ void		HnswInitPage(Buffer buf, Page page);
+ void		HnswInit(void);
+-List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
+-HnswElement HnswGetEntryPoint(Relation index);
+-void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
++List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, void * pqstate, bool candidatePruning);
++HnswElement HnswGetEntryPoint(Relation index, char *entryMetadata);
++BlockNumber	HnswGetHeadBlockNumber(Relation index);
++void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint, char *entryMetadata);
+ void	   *HnswAlloc(HnswAllocator * allocator, Size size);
+ HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
+ HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
+-void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
+-HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement em, HnswQuery * q, Relation rel, HnswSupport * support, bool loadVec);
+-void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
+-void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
++void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, int efConstruction, bool existing, void * pqstate, char *entryMetadata);
++HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement em, HnswQuery * q, Relation rel, HnswSupport * support, bool loadVec, void * pqstate, char *neighborMetadata);
++void		HnswUpdateMetaPage(Relation index, int updateEntry, const HnswTypeInfo * typeInfo, HnswSupport * support, char *base, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building, void * pqstate);
++void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m, const HnswTypeInfo * typeInfo, HnswSupport * support, void * pqstate);
+ void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
+ HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
+ void		HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * alloc);
+-bool		HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building);
+-void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building);
+-void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
+-void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
++bool		HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, Datum value, ItemPointer heaptid, bool building, void * pqstate);
++void		HnswUpdateNeighborsOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building, void * pqstate);
++void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec, Relation index, HnswSupport * support, void * pqstate, char *neighborMetadata);
++void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, void * pqstate, char *neighborMetadata);
+ bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
+-void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
++void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, HnswSupport * support, void * pqstate);
+ void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
+-bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
++bool		HnswLoadNeighborEntries(HnswElement element, HnswNeighborEntryData *entries, Relation index, int m, int lm, int lc, bool hasNeighborMetadata);
+ void		HnswInitLockTranche(void);
+ const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
++Size		HnswCalculateElementTupleSize(void * pqstate, Datum v);
+ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+ 
+ /* Index access methods */
+diff --git a/src/hnswbuild.c b/src/hnswbuild.c
+index b667478..9fddcbb 100644
+--- a/src/hnswbuild.c
++++ b/src/hnswbuild.c
+@@ -47,6 +47,7 @@
+ #include "catalog/pg_type_d.h"
+ #include "commands/progress.h"
+ #include "hnsw.h"
++#include "hnswpq.h"
+ #include "miscadmin.h"
+ #include "optimizer/optimizer.h"
+ #include "storage/bufmgr.h"
+@@ -68,6 +69,7 @@
+ #define PARALLEL_KEY_HNSW_SHARED		UINT64CONST(0xA000000000000001)
+ #define PARALLEL_KEY_HNSW_AREA			UINT64CONST(0xA000000000000002)
+ #define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000003)
++#define PARALLEL_KEY_HNSW_PQ_STATE		UINT64CONST(0xA000000000000004)
+ 
+ /*
+  * Create the metapage
+@@ -95,10 +97,18 @@ CreateMetaPage(HnswBuildState * buildstate)
+ 	metap->entryBlkno = InvalidBlockNumber;
+ 	metap->entryOffno = InvalidOffsetNumber;
+ 	metap->entryLevel = -1;
++
++	memset(metap->entryMetadata, 0, HNSW_NEIGHBOR_METADATA_BYTES);
++
+ 	metap->insertPage = InvalidBlockNumber;
+ 	((PageHeader) page)->pd_lower =
+ 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
+ 
++	metap->headBlkno = HNSW_HEAD_BLKNO;
++
++	/* Set PQ codebook information and update the head block position */
++	metap->headBlkno += HnswCreatePQPages(buildstate, &metap->pqPages);
++
+ 	MarkBufferDirty(buf);
+ 	UnlockReleaseBuffer(buf);
+ }
+@@ -139,6 +149,8 @@ CreateGraphPages(HnswBuildState * buildstate)
+ {
+ 	Relation	index = buildstate->index;
+ 	ForkNumber	forkNum = buildstate->forkNum;
++	bool		hasNeighborMetadata = buildstate->hasNeighborMetadata;
++	const		HnswTypeInfo *typeInfo = buildstate->typeInfo;
+ 	Size		maxSize;
+ 	HnswElementTuple etup;
+ 	HnswNeighborTuple ntup;
+@@ -176,8 +188,8 @@ CreateGraphPages(HnswBuildState * buildstate)
+ 		MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
+ 
+ 		/* Calculate sizes */
+-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+-		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
++		etupSize = HnswCalculateElementTupleSize(buildstate->pqState, PointerGetDatum(valuePtr));
++		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m, hasNeighborMetadata);
+ 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
+ 
+ 		/* Initial size check */
+@@ -186,7 +198,7 @@ CreateGraphPages(HnswBuildState * buildstate)
+ 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+ 					 errmsg("index tuple too large")));
+ 
+-		HnswSetElementTuple(base, etup, element);
++		HnswSetElementTuple(base, etup, element, &buildstate->support, buildstate->pqState);
+ 
+ 		/* Keep element and neighbors on the same page if possible */
+ 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
+@@ -228,7 +240,7 @@ CreateGraphPages(HnswBuildState * buildstate)
+ 	UnlockReleaseBuffer(buf);
+ 
+ 	entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
+-	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint, insertPage, forkNum, true);
++	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, typeInfo, &buildstate->support, base, entryPoint, insertPage, forkNum, true, buildstate->pqState);
+ 
+ 	pfree(etup);
+ 	pfree(ntup);
+@@ -242,6 +254,9 @@ WriteNeighborTuples(HnswBuildState * buildstate)
+ {
+ 	Relation	index = buildstate->index;
+ 	ForkNumber	forkNum = buildstate->forkNum;
++	bool		hasNeighborMetadata = buildstate->hasNeighborMetadata;
++	const		HnswTypeInfo *typeInfo = buildstate->typeInfo;
++	HnswSupport *support = &buildstate->support;
+ 	int			m = buildstate->m;
+ 	HnswElementPtr iter = buildstate->graph->head;
+ 	char	   *base = buildstate->hnswarea;
+@@ -255,7 +270,7 @@ WriteNeighborTuples(HnswBuildState * buildstate)
+ 		HnswElement element = HnswPtrAccess(base, iter);
+ 		Buffer		buf;
+ 		Page		page;
+-		Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
++		Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m, hasNeighborMetadata);
+ 
+ 		/* Update iterator */
+ 		iter = element->next;
+@@ -271,7 +286,7 @@ WriteNeighborTuples(HnswBuildState * buildstate)
+ 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+ 		page = BufferGetPage(buf);
+ 
+-		HnswSetNeighborTuple(base, ntup, element, m);
++		HnswSetNeighborTuple(base, ntup, element, m, typeInfo, support, buildstate->pqState);
+ 
+ 		if (!PageIndexTupleOverwrite(page, element->neighborOffno, (Item) ntup, ntupSize))
+ 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+@@ -418,6 +433,12 @@ UpdateGraphInMemory(HnswSupport * support, HnswElement element, int m, int efCon
+ 		HnswPtrStore(base, graph->entryPoint, element);
+ }
+ 
++static void
++FindElementNeighborsInMemory(char *base, HnswElement element, HnswElement entryPoint, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, int efConstruction, bool existing)
++{
++	HnswFindElementNeighbors(base, element, entryPoint, NULL, typeInfo, support, m, efConstruction, false, NULL, NULL);
++}
++
+ /*
+  * Insert tuple in memory
+  */
+@@ -425,6 +446,7 @@ static void
+ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
+ {
+ 	HnswGraph  *graph = buildstate->graph;
++	const		HnswTypeInfo *typeInfo = buildstate->typeInfo;
+ 	HnswSupport *support = &buildstate->support;
+ 	HnswElement entryPoint;
+ 	LWLock	   *entryLock = &graph->entryLock;
+@@ -457,7 +479,7 @@ InsertTupleInMemory(HnswBuildState * buildstate, HnswElement element)
+ 	}
+ 
+ 	/* Find neighbors for element */
+-	HnswFindElementNeighbors(base, element, entryPoint, NULL, support, m, efConstruction, false);
++	FindElementNeighborsInMemory(base, element, entryPoint, NULL, typeInfo, support, m, efConstruction, false);
+ 
+ 	/* Update graph in memory */
+ 	UpdateGraphInMemory(support, element, m, efConstruction, entryPoint, buildstate);
+@@ -497,7 +519,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
+ 	{
+ 		LWLockRelease(flushLock);
+ 
+-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
++		return HnswInsertTupleOnDisk(index, buildstate->typeInfo, support, value, heaptid, true, buildstate->pqState);
+ 	}
+ 
+ 	/*
+@@ -529,7 +551,7 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
+ 
+ 		LWLockRelease(flushLock);
+ 
+-		return HnswInsertTupleOnDisk(index, support, value, heaptid, true);
++		return HnswInsertTupleOnDisk(index, buildstate->typeInfo, support, value, heaptid, true, buildstate->pqState);
+ 	}
+ 
+ 	/* Ok, we can proceed to allocate the element */
+@@ -664,6 +686,8 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
+ 
+ 	buildstate->m = HnswGetM(index);
+ 	buildstate->efConstruction = HnswGetEfConstruction(index);
++	buildstate->hasNeighborMetadata = HnswSupportNeighborMetadata(index);
++	buildstate->enableCompression = HnswGetEnableCompression(index);
+ 	buildstate->dimensions = TupleDescAttr(index->rd_att, 0)->atttypmod;
+ 
+ 	/* Disallow varbit since require fixed dimensions */
+@@ -699,6 +723,11 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
+ 	buildstate->ml = HnswGetMl(buildstate->m);
+ 	buildstate->maxLevel = HnswGetMaxLevel(buildstate->m);
+ 
++	/* For PQ state */
++	buildstate->pqState = NULL;
++	buildstate->kmeansnormprocinfo = NULL;
++	buildstate->collation = InvalidOid;
++
+ 	buildstate->graphCtx = GenerationContextCreate(CurrentMemoryContext,
+ 												   "Hnsw build graph context",
+ #if PG_VERSION_NUM >= 150000
+@@ -722,6 +751,8 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
+ static void
+ FreeBuildState(HnswBuildState * buildstate)
+ {
++	HnswFreePQState(buildstate);
++
+ 	MemoryContextDelete(buildstate->graphCtx);
+ 	MemoryContextDelete(buildstate->tmpCtx);
+ }
+@@ -763,7 +794,7 @@ ParallelHeapScan(HnswBuildState * buildstate)
+  * Perform a worker's portion of a parallel insert
+  */
+ static void
+-HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnswshared, char *hnswarea, bool progress)
++HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnswshared, char *hnswarea, shm_toc *toc, bool progress)
+ {
+ 	HnswBuildState buildstate;
+ 	TableScanDesc scan;
+@@ -776,6 +807,18 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
+ 	InitBuildState(&buildstate, heapRel, indexRel, indexInfo, MAIN_FORKNUM);
+ 	buildstate.graph = &hnswshared->graphData;
+ 	buildstate.hnswarea = hnswarea;
++
++	/* Restore PQ state from shared memory if present */
++	if (hnswshared->hasPqState)
++	{
++		char *sharedpqstate = shm_toc_lookup(toc, PARALLEL_KEY_HNSW_PQ_STATE, false);
++		HnswLoadPQStateFromShm(sharedpqstate, &buildstate, hnswshared);
++	}
++	else
++	{
++		buildstate.pqState = NULL;
++	}
++
+ 	InitAllocator(&buildstate.allocator, &HnswSharedMemoryAlloc, &buildstate);
+ 	scan = table_beginscan_parallel(heapRel,
+ 									ParallelTableScanFromHnswShared(hnswshared));
+@@ -844,7 +887,7 @@ HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc)
+ 	hnswarea = shm_toc_lookup(toc, PARALLEL_KEY_HNSW_AREA, false);
+ 
+ 	/* Perform inserts */
+-	HnswParallelScanAndInsert(heapRel, indexRel, hnswshared, hnswarea, false);
++	HnswParallelScanAndInsert(heapRel, indexRel, hnswshared, hnswarea, toc, false);
+ 
+ 	/* Close relations within worker */
+ 	index_close(indexRel, indexLockmode);
+@@ -885,7 +928,7 @@ HnswLeaderParticipateAsWorker(HnswBuildState * buildstate)
+ 	HnswLeader *hnswleader = buildstate->hnswleader;
+ 
+ 	/* Perform work common to all participants */
+-	HnswParallelScanAndInsert(buildstate->heap, buildstate->index, hnswleader->hnswshared, hnswleader->hnswarea, true);
++	HnswParallelScanAndInsert(buildstate->heap, buildstate->index, hnswleader->hnswshared, hnswleader->hnswarea, hnswleader->pcxt->toc, true);
+ }
+ 
+ /*
+@@ -898,6 +941,7 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
+ 	Snapshot	snapshot;
+ 	Size		esthnswshared;
+ 	Size		esthnswarea;
++	Size		estpq;
+ 	Size		estother;
+ 	HnswShared *hnswshared;
+ 	char	   *hnswarea;
+@@ -924,6 +968,11 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
+ 	esthnswshared = ParallelEstimateShared(buildstate->heap, snapshot);
+ 	shm_toc_estimate_chunk(&pcxt->estimator, esthnswshared);
+ 
++	/* Estimate metadata state size */
++	estpq = HnswEstimateSharedPQState(buildstate);
++	if (estpq > 0)
++		shm_toc_estimate_chunk(&pcxt->estimator, estpq);
++
+ 	/* Leave space for other objects in shared memory */
+ 	/* Docker has a default limit of 64 MB for shm_size */
+ 	/* which happens to be the default value of maintenance_work_mem */
+@@ -933,7 +982,7 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
+ 		esthnswarea -= estother;
+ 
+ 	shm_toc_estimate_chunk(&pcxt->estimator, esthnswarea);
+-	shm_toc_estimate_keys(&pcxt->estimator, 2);
++	shm_toc_estimate_keys(&pcxt->estimator, 2 + (estpq > 0 ? 1 : 0));
+ 
+ 	/* Finally, estimate PARALLEL_KEY_QUERY_TEXT space */
+ 	if (debug_query_string)
+@@ -964,6 +1013,13 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
+ 	hnswshared->heaprelid = RelationGetRelid(buildstate->heap);
+ 	hnswshared->indexrelid = RelationGetRelid(buildstate->index);
+ 	hnswshared->isconcurrent = isconcurrent;
++
++	/* Store PQ state in shared memory if present */
++	if (estpq > 0)
++		shm_toc_insert(pcxt->toc, PARALLEL_KEY_HNSW_PQ_STATE, HnswCopyPQStateToShm(pcxt, buildstate, estpq));
++
++	hnswshared->hasPqState = (buildstate->pqState != NULL);
++
+ 	ConditionVariableInit(&hnswshared->workersdonecv);
+ 	SpinLockInit(&hnswshared->mutex);
+ 	/* Initialize mutable state */
+@@ -1102,6 +1158,9 @@ BuildIndex(Relation heap, Relation index, IndexInfo *indexInfo,
+ 
+ 	InitBuildState(buildstate, heap, index, indexInfo, forkNum);
+ 
++	/* Initialize PQ state (neighbor metadata and element compression) */
++	HnswInitPQState(index, buildstate);
++
+ 	BuildGraph(buildstate, forkNum);
+ 
+ 	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
+diff --git a/src/hnswinsert.c b/src/hnswinsert.c
+index a5fac4e..a4f9c47 100644
+--- a/src/hnswinsert.c
++++ b/src/hnswinsert.c
+@@ -4,6 +4,7 @@
+ 
+ #include "access/generic_xlog.h"
+ #include "hnsw.h"
++#include "hnswpq.h"
+ #include "storage/bufmgr.h"
+ #include "storage/lmgr.h"
+ #include "utils/datum.h"
+@@ -136,7 +137,7 @@ HnswInsertAppendPage(Relation index, Buffer *nbuf, Page *npage, GenericXLogState
+  * Add to element and neighbor pages
+  */
+ static void
+-AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, BlockNumber *updatedInsertPage, bool building)
++AddElementOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport *support, void * pqstate, HnswElement e, int m, BlockNumber insertPage, BlockNumber *updatedInsertPage, bool building, bool hasNeighborMetadata)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+@@ -158,19 +159,20 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
+ 	char	   *base = NULL;
+ 
+ 	/* Calculate sizes */
+-	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
+-	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
++
++	etupSize = HnswCalculateElementTupleSize(pqstate, HnswGetValue(base, e));
++	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m, hasNeighborMetadata);
+ 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
+ 	maxSize = HNSW_MAX_SIZE;
+-	minCombinedSize = etupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m) + sizeof(ItemIdData);
++	minCombinedSize = etupSize + HNSW_NEIGHBOR_TUPLE_SIZE(0, m, hasNeighborMetadata) + sizeof(ItemIdData);
+ 
+ 	/* Prepare element tuple */
+ 	etup = palloc0(etupSize);
+-	HnswSetElementTuple(base, etup, e);
++	HnswSetElementTuple(base, etup, e, support, pqstate);
+ 
+ 	/* Prepare neighbor tuple */
+ 	ntup = palloc0(ntupSize);
+-	HnswSetNeighborTuple(base, ntup, e, m);
++	HnswSetNeighborTuple(base, ntup, e, m, typeInfo, support, pqstate);
+ 
+ 	/* Find a page (or two if needed) to insert the tuples */
+ 	for (;;)
+@@ -344,18 +346,18 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
+  * Load neighbors
+  */
+ static HnswNeighborArray *
+-HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
++HnswLoadNeighbors(HnswElement element, Relation index, const HnswTypeInfo * typeInfo, int m, int lm, int lc, bool hasNeighborMetadata)
+ {
+ 	char	   *base = NULL;
+ 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
+-	ItemPointerData indextids[HNSW_MAX_M * 2];
++	HnswNeighborEntryData entries[HNSW_MAX_M * 2];
+ 
+-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
++	if (!HnswLoadNeighborEntries(element, entries, index, m, lm, lc, hasNeighborMetadata))
+ 		return neighbors;
+ 
+ 	for (int i = 0; i < lm; i++)
+ 	{
+-		ItemPointer indextid = &indextids[i];
++		ItemPointer indextid = &entries[i].indextid;
+ 		HnswElement e;
+ 		HnswCandidate *hc;
+ 
+@@ -374,7 +376,7 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
+  * Load elements for insert
+  */
+ static void
+-LoadElementsForInsert(HnswNeighborArray * neighbors, HnswQuery * q, int *idx, Relation index, HnswSupport * support)
++LoadElementsForInsert(HnswNeighborArray * neighbors, HnswQuery * q, int *idx, Relation index, HnswSupport * support, void * pqstate, char *neighborMetadata)
+ {
+ 	char	   *base = NULL;
+ 
+@@ -384,7 +386,7 @@ LoadElementsForInsert(HnswNeighborArray * neighbors, HnswQuery * q, int *idx, Re
+ 		HnswElement element = HnswPtrAccess(base, hc->element);
+ 		double		distance;
+ 
+-		HnswLoadElement(element, &distance, q, index, support, true, NULL);
++		HnswLoadElement(element, &distance, q, index, support, true, NULL, pqstate, neighborMetadata);
+ 		hc->distance = distance;
+ 
+ 		/* Prune element if being deleted */
+@@ -400,7 +402,7 @@ LoadElementsForInsert(HnswNeighborArray * neighbors, HnswQuery * q, int *idx, Re
+  * Get update index
+  */
+ static int
+-GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int m, int lm, int lc, Relation index, HnswSupport * support, MemoryContext updateCtx)
++GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int m, int lm, int lc, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, MemoryContext updateCtx, void * pqstate, char *neighborMetadata)
+ {
+ 	char	   *base = NULL;
+ 	int			idx = -1;
+@@ -412,7 +414,7 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int
+ 	 * selecting neighbors can take time. Could use optimistic locking to
+ 	 * retry if another update occurs before getting exclusive lock.
+ 	 */
+-	neighbors = HnswLoadNeighbors(element, index, m, lm, lc);
++	neighbors = HnswLoadNeighbors(element, index, typeInfo, m, lm, lc, HNSW_PQ_NEIGHBOR_METADATA_EXISTS(pqstate));
+ 
+ 	/*
+ 	 * Could improve performance for vacuuming by checking neighbors against
+@@ -429,7 +431,7 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int
+ 
+ 		q.value = HnswGetValue(base, element);
+ 
+-		LoadElementsForInsert(neighbors, &q, &idx, index, support);
++		LoadElementsForInsert(neighbors, &q, &idx, index, support, pqstate, neighborMetadata);
+ 
+ 		if (idx == -1)
+ 			HnswUpdateConnection(base, neighbors, newElement, distance, lm, &idx, index, support);
+@@ -445,11 +447,11 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int
+  * Check if connection already exists
+  */
+ static bool
+-ConnectionExists(HnswElement e, HnswNeighborTuple ntup, int startIdx, int lm)
++ConnectionExists(HnswElement e, HnswNeighborTuple ntup, const HnswTypeInfo * typeInfo, int startIdx, int lm, bool hasNeighborMetadata)
+ {
+ 	for (int i = 0; i < lm; i++)
+ 	{
+-		ItemPointer indextid = &ntup->indextids[startIdx + i];
++		ItemPointer indextid = HnswNeighborEntryItemPointerAccess(ntup->entries, startIdx + i, hasNeighborMetadata);
+ 
+ 		if (!ItemPointerIsValid(indextid))
+ 			break;
+@@ -465,7 +467,7 @@ ConnectionExists(HnswElement e, HnswNeighborTuple ntup, int startIdx, int lm)
+  * Update neighbor
+  */
+ static void
+-UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m, int lm, int lc, Relation index, bool checkExisting, bool building)
++UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m, int lm, int lc, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, bool checkExisting, bool building, void * pqstate)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+@@ -473,6 +475,7 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
+ 	HnswNeighborTuple ntup;
+ 	int			startIdx;
+ 	OffsetNumber offno = element->neighborOffno;
++	bool		hasNeighborMetadata = HNSW_PQ_NEIGHBOR_METADATA_EXISTS(pqstate);
+ 
+ 	/* Register page */
+ 	buf = ReadBuffer(index, element->neighborPage);
+@@ -495,7 +498,7 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
+ 	startIdx = (element->level - lc) * m;
+ 
+ 	/* Check for existing connection */
+-	if (checkExisting && ConnectionExists(newElement, ntup, startIdx, lm))
++	if (checkExisting && ConnectionExists(newElement, ntup, typeInfo, startIdx, lm, hasNeighborMetadata))
+ 		idx = -1;
+ 	else if (idx == -2)
+ 	{
+@@ -503,7 +506,9 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
+ 		/* TODO Retry updating connections if not */
+ 		for (int j = 0; j < lm; j++)
+ 		{
+-			if (!ItemPointerIsValid(&ntup->indextids[startIdx + j]))
++			ItemPointer indextid = HnswNeighborEntryItemPointerAccess(ntup->entries, startIdx + j, hasNeighborMetadata);
++
++			if (!ItemPointerIsValid(indextid))
+ 			{
+ 				idx = startIdx + j;
+ 				break;
+@@ -516,11 +521,18 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
+ 	/* Make robust to issues */
+ 	if (idx >= 0 && idx < ntup->count)
+ 	{
+-		ItemPointer indextid = &ntup->indextids[idx];
++		ItemPointer indextid = HnswNeighborEntryItemPointerAccess(ntup->entries, idx, hasNeighborMetadata);
++		char	   *base = NULL;
+ 
+ 		/* Update neighbor on the buffer */
+ 		ItemPointerSet(indextid, newElement->blkno, newElement->offno);
+ 
++		if (hasNeighborMetadata)
++		{
++			char *metadata = HnswNeighborEntryMetadataAccess(ntup->entries, idx, hasNeighborMetadata);
++			typeInfo->setNeighborMetadata(metadata, HnswGetValue(base, newElement), pqstate, support);
++		}
++
+ 		/* Commit */
+ 		if (building)
+ 			MarkBufferDirty(buf);
+@@ -537,7 +549,7 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
+  * Update neighbors
+  */
+ void
+-HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building)
++HnswUpdateNeighborsOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, HnswElement e, int m, bool checkExisting, bool building, void * pqstate)
+ {
+ 	char	   *base = NULL;
+ 
+@@ -560,13 +572,13 @@ HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e,
+ 			HnswElement neighborElement = HnswPtrAccess(base, hc->element);
+ 			int			idx;
+ 
+-			idx = GetUpdateIndex(neighborElement, e, hc->distance, m, lm, lc, index, support, updateCtx);
++			idx = GetUpdateIndex(neighborElement, e, hc->distance, m, lm, lc, index, typeInfo, support, updateCtx, pqstate, hc->neighborMetadata);
+ 
+ 			/* New element was not selected as a neighbor */
+ 			if (idx == -1)
+ 				continue;
+ 
+-			UpdateNeighborOnDisk(neighborElement, e, idx, m, lm, lc, index, checkExisting, building);
++			UpdateNeighborOnDisk(neighborElement, e, idx, m, lm, lc, index, typeInfo, support, checkExisting, building, pqstate);
+ 		}
+ 	}
+ 
+@@ -660,7 +672,7 @@ FindDuplicateOnDisk(Relation index, HnswElement element, bool building)
+  * Update graph on disk
+  */
+ static void
+-UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, int m, int efConstruction, HnswElement entryPoint, bool building)
++UpdateGraphOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, void * pqstate, HnswElement element, int m, int efConstruction, HnswElement entryPoint, bool building, bool hasNeighborMetadata)
+ {
+ 	BlockNumber newInsertPage = InvalidBlockNumber;
+ 
+@@ -669,32 +681,34 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
+ 		return;
+ 
+ 	/* Add element */
+-	AddElementOnDisk(index, element, m, GetInsertPage(index), &newInsertPage, building);
++	AddElementOnDisk(index, typeInfo, support, pqstate, element, m, GetInsertPage(index), &newInsertPage, building, hasNeighborMetadata);
+ 
+ 	/* Update insert page if needed */
+ 	if (BlockNumberIsValid(newInsertPage))
+-		HnswUpdateMetaPage(index, 0, NULL, newInsertPage, MAIN_FORKNUM, building);
++		HnswUpdateMetaPage(index, 0, NULL, NULL, NULL, NULL, newInsertPage, MAIN_FORKNUM, building, NULL);
+ 
+ 	/* Update neighbors */
+-	HnswUpdateNeighborsOnDisk(index, support, element, m, false, building);
++	HnswUpdateNeighborsOnDisk(index, typeInfo, support, element, m, false, building, pqstate);
+ 
+ 	/* Update entry point if needed */
+ 	if (entryPoint == NULL || element->level > entryPoint->level)
+-		HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, building);
++		HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, typeInfo, support, NULL, element, InvalidBlockNumber, MAIN_FORKNUM, building, pqstate);
+ }
+ 
+ /*
+  * Insert a tuple into the index
+  */
+ bool
+-HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPointer heaptid, bool building)
++HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, Datum value, ItemPointer heaptid, bool building, void * pqstate)
+ {
+ 	HnswElement entryPoint;
+ 	HnswElement element;
+ 	int			m;
+ 	int			efConstruction = HnswGetEfConstruction(index);
++	bool		hasNeighborMetadata = HNSW_PQ_NEIGHBOR_METADATA_EXISTS(pqstate);
+ 	LOCKMODE	lockmode = ShareLock;
+ 	char	   *base = NULL;
++	char		entryMetadata[HNSW_NEIGHBOR_METADATA_BYTES];
+ 
+ 	/*
+ 	 * Get a shared lock. This allows vacuum to ensure no in-flight inserts
+@@ -704,7 +718,7 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
+ 	LockPage(index, HNSW_UPDATE_LOCK, lockmode);
+ 
+ 	/* Get m and entry point */
+-	HnswGetMetaPageInfo(index, &m, &entryPoint);
++	HnswGetMetaPageInfo(index, &m, &entryPoint, entryMetadata);
+ 
+ 	/* Create an element */
+ 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
+@@ -721,14 +735,14 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
+ 		LockPage(index, HNSW_UPDATE_LOCK, lockmode);
+ 
+ 		/* Get latest entry point after lock is acquired */
+-		entryPoint = HnswGetEntryPoint(index);
++		entryPoint = HnswGetEntryPoint(index, entryMetadata);
+ 	}
+ 
+ 	/* Find neighbors for element */
+-	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, false);
++	HnswFindElementNeighbors(base, element, entryPoint, index, typeInfo, support, m, efConstruction, false, pqstate, entryMetadata);
+ 
+ 	/* Update graph on disk */
+-	UpdateGraphOnDisk(index, support, element, m, efConstruction, entryPoint, building);
++	UpdateGraphOnDisk(index, typeInfo, support, pqstate, element, m, efConstruction, entryPoint, building, hasNeighborMetadata);
+ 
+ 	/* Release lock */
+ 	UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
+@@ -740,7 +754,7 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
+  * Insert a tuple into the index
+  */
+ static void
+-HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid)
++HnswInsertTuple(Relation index, void * pqstate, Datum *values, bool *isnull, ItemPointer heaptid)
+ {
+ 	Datum		value;
+ 	const		HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
+@@ -752,7 +766,7 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
+ 	if (!HnswFormIndexValue(&value, values, isnull, typeInfo, &support))
+ 		return;
+ 
+-	HnswInsertTupleOnDisk(index, &support, value, heaptid, false);
++	HnswInsertTupleOnDisk(index, typeInfo, &support, value, heaptid, false, pqstate);
+ }
+ 
+ /*
+@@ -769,6 +783,7 @@ hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
+ {
+ 	MemoryContext oldCtx;
+ 	MemoryContext insertCtx;
++	void		  *pqstate;
+ 
+ 	/* Skip nulls */
+ 	if (isnull[0])
+@@ -780,8 +795,11 @@ hnswinsert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
+ 									  ALLOCSET_DEFAULT_SIZES);
+ 	oldCtx = MemoryContextSwitchTo(insertCtx);
+ 
++	/* Load PQ state */
++	pqstate = HnswLoadPQStateFromDisk(index);
++
+ 	/* Insert tuple */
+-	HnswInsertTuple(index, values, isnull, heap_tid);
++	HnswInsertTuple(index, pqstate, values, isnull, heap_tid);
+ 
+ 	/* Delete memory context */
+ 	MemoryContextSwitchTo(oldCtx);
+diff --git a/src/hnswpq.c b/src/hnswpq.c
+new file mode 100644
+index 0000000..6058aff
+--- /dev/null
++++ b/src/hnswpq.c
+@@ -0,0 +1,1294 @@
++#include "postgres.h"
++
++#include <float.h>
++#include <math.h>
++
++#include "access/table.h"
++#include "access/tableam.h"
++#include "access/heapam.h"
++#include "catalog/index.h"
++#include "catalog/pg_proc.h"
++#include "hnsw.h"
++#include "hnswpq.h"
++#include "storage/bufmgr.h"
++#include "utils/float.h"
++#include "utils/datum.h"
++#include "utils/memutils.h"
++#include "utils/rel.h"
++#include "utils/syscache.h"
++
++/*
++ * Get whether neighbor metadata is stored in the index
++ */
++static bool
++HnswGetNeighborMetadata(Relation index)
++{
++	HnswOptions *opts = (HnswOptions *) index->rd_options;
++
++	if (opts)
++		return opts->neighborMetadata;
++
++	return HNSW_DEFAULT_NEIGHBOR_METADATA;
++}
++
++/*
++ * Check if neighbor metadata is supported
++ */
++bool
++HnswSupportNeighborMetadata(Relation index)
++{
++	/* Force disable if the indexed data type does not support PQ */
++	const HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
++	return HnswGetNeighborMetadata(index) && typeInfo->pqEnabled;
++}
++
++/*
++ * Get whether element compression is enabled in the index
++ */
++bool
++HnswGetEnableCompression(Relation index)
++{
++	HnswOptions *opts = (HnswOptions *) index->rd_options;
++
++	if (opts)
++		return opts->enableCompression;
++
++	return HNSW_DEFAULT_ENABLE_COMPRESSION;
++}
++
++/*
++ * Initialize a PQ state structure with default values
++ */
++static HnswPQCentroidState *
++InitCentroidState(void)
++{
++	HnswPQCentroidState *state = (HnswPQCentroidState *) palloc(sizeof(HnswPQCentroidState));
++
++	/* Initialize with default values */
++	state->m = 0;
++	state->subvectorDim = 0;
++	state->centroids = NULL;
++
++	return state;
++}
++
++/*
++ * Check if non-zero norm (Copied from ivfutils.c#IvfflatCheckNorm())
++ */
++static bool
++CheckNorm(FmgrInfo *procinfo, Oid collation, Datum value)
++{
++	return DatumGetFloat8(FunctionCall1Coll(procinfo, collation, value)) > 0;
++}
++
++/*
++ * Normalize value (Copied from ivfbuild.c#IvfflatNormValue())
++ */
++static Datum
++NormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value)
++{
++	return DirectFunctionCall1Coll(typeInfo->normalize, collation, value);
++}
++
++/*
++ * Add sample (Copied from ivfbuild.c#AddSample())
++ */
++static void
++AddSample(Datum *values, HnswBuildState * buildstate)
++{
++	VectorArray samples = buildstate->samples;
++	int			targsamples = samples->maxlen;
++
++	/* Detoast once for all calls */
++	Datum		value = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
++
++	/*
++	 * Normalize with KMEANS_NORM_PROC since spherical distance function
++	 * expects unit vectors
++	 */
++	if (buildstate->kmeansnormprocinfo != NULL)
++	{
++		if (!CheckNorm(buildstate->kmeansnormprocinfo, buildstate->collation, value))
++			return;
++
++		value = NormValue(buildstate->typeInfo, buildstate->collation, value);
++	}
++
++	if (samples->length < targsamples)
++	{
++		VectorArraySet(samples, samples->length, DatumGetPointer(value));
++		samples->length++;
++	}
++	else
++	{
++		if (buildstate->rowstoskip < 0)
++			buildstate->rowstoskip = reservoir_get_next_S(&buildstate->rstate, samples->length, targsamples);
++
++		if (buildstate->rowstoskip <= 0)
++		{
++#if PG_VERSION_NUM >= 150000
++			int			k = (int) (targsamples * sampler_random_fract(&buildstate->rstate.randstate));
++#else
++			int			k = (int) (targsamples * sampler_random_fract(buildstate->rstate.randstate));
++#endif
++
++			Assert(k >= 0 && k < targsamples);
++			VectorArraySet(samples, k, DatumGetPointer(value));
++		}
++
++		buildstate->rowstoskip -= 1;
++	}
++}
++
++/*
++ * Callback for sampling (Copied from ivfbuild.c#SampleCallback())
++ */
++static void
++SampleCallback(Relation index, ItemPointer tid, Datum *values,
++			   bool *isnull, bool tupleIsAlive, void *state)
++{
++	HnswBuildState *buildstate = (HnswBuildState *) state;
++	MemoryContext	oldCtx;
++
++	/* Skip nulls */
++	if (isnull[0])
++		return;
++
++	/* Use memory context since detoast can allocate */
++	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
++
++	/* Add sample */
++	AddSample(values, buildstate);
++
++	/* Reset memory context */
++	MemoryContextSwitchTo(oldCtx);
++	MemoryContextReset(buildstate->tmpCtx);
++}
++
++/*
++ * Sample rows with same logic as ANALYZE (Copied from ivfbuild.c#SampleRows())
++ */
++static void
++SampleRows(HnswBuildState * buildstate)
++{
++	VectorArray samples = (VectorArray) buildstate->samples;
++	int			targsamples = samples->maxlen;
++	BlockNumber totalblocks = RelationGetNumberOfBlocks(buildstate->heap);
++
++	buildstate->rowstoskip = -1;
++
++	BlockSampler_Init(&buildstate->bs, totalblocks, targsamples, RandomInt());
++
++	reservoir_init_selection_state(&buildstate->rstate, targsamples);
++	while (BlockSampler_HasMore(&buildstate->bs))
++	{
++		BlockNumber targblock = BlockSampler_Next(&buildstate->bs);
++
++		table_index_build_range_scan(buildstate->heap, buildstate->index, buildstate->indexInfo,
++									 false, true, false, targblock, 1, SampleCallback, (void *) buildstate, NULL);
++	}
++}
++
++/*
++ * Initialize and sample vectors for PQ training
++ */
++static void
++InitializeSamples(HnswBuildState * buildstate)
++{
++	VectorArray    *samples = (VectorArray *) &buildstate->samples;
++	int 			numSamples;
++
++	/* Target 50 samples per centroid */
++	numSamples = HNSW_PQ_NUM_CENTROIDS * 50;
++
++	/* Skip samples for unlogged table */
++	if (buildstate->heap == NULL)
++		numSamples = 1;
++
++	/* Initialize samples array */
++	*samples = VectorArrayInit(numSamples, buildstate->dimensions, buildstate->typeInfo->itemSize(buildstate->dimensions));
++
++	if (buildstate->heap != NULL)
++	{
++		SampleRows(buildstate);
++
++		if ((*samples)->length < HNSW_PQ_NUM_CENTROIDS)
++		{
++			ereport(NOTICE,
++					(errmsg("hnsw index PQ state initialized with little data"),
++					 errdetail("This will cause low recall."),
++					 errhint("Drop the index until the table has more data.")));
++		}
++	}
++}
++
++static void
++KmeansImpl(Relation index, VectorArray samples, VectorArray centers, HnswBuildState * buildstate)
++{
++	const IvfflatTypeInfo typeInfo = {
++		.maxDimensions = buildstate->typeInfo->maxDimensions,
++		.normalize = buildstate->typeInfo->normalize,
++		.itemSize = buildstate->typeInfo->itemSize,
++		.updateCenter = buildstate->typeInfo->updateCenter,
++		.sumCenter = buildstate->typeInfo->sumCenter
++	};
++	const KmeansInfo kmeansInfo = {
++		.procinfo = buildstate->support.procinfo,
++		.normprocinfo = NULL,	/* No normalization for PQ */
++		.collation = buildstate->support.collation
++	};
++
++	/* TODO Move k-means implementation to a file that can be referenced by both HNSW and IVFFlat */
++	IvfflatKmeans(index, samples, centers, &typeInfo, &kmeansInfo);
++}
++
++/*
++ * Train PQ centroids for each subvector
++ */
++static void
++TrainPQCentroids(Relation index, VectorArray samples, HnswPQCentroidState * pqstate, HnswBuildState * buildstate)
++{
++	VectorArray subvectorSamples;
++
++	/* Allocate centroids array */
++	pqstate->centroids = (VectorArray *) palloc0(sizeof(VectorArray) * pqstate->m);
++
++	/* Allocate samples for subvectors */
++	subvectorSamples = VectorArrayInit(samples->length, pqstate->subvectorDim, buildstate->typeInfo->itemSize(pqstate->subvectorDim));
++	subvectorSamples->length = samples->length;
++
++	for (int i = 0; i < pqstate->m; i++)
++	{
++		int	startDim = i * pqstate->subvectorDim;
++		int	endDim = Min(startDim + pqstate->subvectorDim, buildstate->dimensions);
++		int	subvectorDim = endDim - startDim;
++		int	itemSize = buildstate->typeInfo->itemSize(subvectorDim);
++
++		/* Extract sub-vectors */
++		for (int j = 0; j < samples->length; j++)
++		{
++			Vector	   *srcVec = (Vector *) VectorArrayGet(samples, j);
++			Vector	   *dstVec = (Vector *) VectorArrayGet(subvectorSamples, j);
++			float	   *srcData = srcVec->x + startDim;
++			float	   *dstData = dstVec->x;
++
++			/* Set vector header */
++			SET_VARSIZE(dstVec, itemSize);
++			dstVec->dim = subvectorDim;
++
++			/* Copy actual data */
++			for (int d = 0; d < subvectorDim; d++)
++				dstData[d] = srcData[d];
++
++			/* Initialize padding elements with 0.0f (if any) */
++			for (int d = subvectorDim; d < pqstate->subvectorDim; d++)
++				dstData[d] = 0.0f;
++		}
++
++		/* Compute centroids for sub-vectors */
++		pqstate->centroids[i] = VectorArrayInit(HNSW_PQ_NUM_CENTROIDS, subvectorDim, itemSize);
++		KmeansImpl(index, subvectorSamples, pqstate->centroids[i], buildstate);
++	}
++
++	/* Free subsamples */
++	VectorArrayFree(subvectorSamples);
++}
++
++/*
++ * Calculate optimal PQ subvector dimension based on vector dimensions
++ * and neighbor metadata size constraints
++ */
++static int
++CalculateOptimalPQSubvectorDimForMetadata(int dimensions)
++{
++	int	minSubvectorDim = 4;
++	int	maxPossibleSubvectors = Min(dimensions / minSubvectorDim, HNSW_NEIGHBOR_METADATA_BYTES);
++	int	preferredSubvectors[] = {2, 4, 6, 8, 10, 12, 14, 16};
++	int	numPreferred = sizeof(preferredSubvectors) / sizeof(preferredSubvectors[0]);
++
++	/* Ensure we can have at least 2 subvectors */
++	if (maxPossibleSubvectors < 2)
++		return (dimensions + 1) / 2;
++
++	/* Try to find optimal subvector count, checking clean division first */
++	for (int i = numPreferred - 1; i >= 0; i--)
++	{
++		int	candidateM = preferredSubvectors[i];
++		int	resultingSubvectorDim;
++
++		if (candidateM > maxPossibleSubvectors)
++			continue;
++
++		/* Prefer clean division if possible */
++		if (dimensions % candidateM == 0)
++			return dimensions / candidateM;
++
++		/* Otherwise check if minimum dimension constraint is met with padding */
++		resultingSubvectorDim = (dimensions + candidateM - 1) / candidateM;
++		if (resultingSubvectorDim >= minSubvectorDim)
++			return resultingSubvectorDim;
++	}
++
++	/* Final fallback: ensure minimum subvector dimension */
++	return Max(minSubvectorDim, (dimensions + maxPossibleSubvectors - 1) / maxPossibleSubvectors);
++}
++
++/* This function is implemented based on ivfbuild.c#ComputeCenters() */
++static void
++InitNeighborPQCentroids(Relation index, HnswBuildState * buildstate)
++{
++	VectorArray		samples = (VectorArray) buildstate->samples;
++	HnswPQState	   *pqstate = (HnswPQState *) buildstate->pqState;
++	HnswPQCentroidState   *cstate;
++
++	cstate = InitCentroidState();
++	pqstate->neighborMetadataState = cstate;
++
++	cstate->subvectorDim = CalculateOptimalPQSubvectorDimForMetadata(buildstate->dimensions);
++	cstate->m = buildstate->dimensions / cstate->subvectorDim;
++
++	/* Account for padding in last subvector */
++	if (buildstate->dimensions % cstate->subvectorDim != 0)
++		cstate->m++;
++
++	/* Train neighbor metadata PQ centroids */
++	TrainPQCentroids(index, samples, cstate, buildstate);
++}
++
++/*
++ * Calculate the distance between values (Copied from hnswutils.c#HnswGetDistance())
++ */
++static inline double
++HnswGetDistance(Datum a, Datum b, HnswSupport * support)
++{
++	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
++}
++
++/*
++ * Generic PQ encoding function
++ */
++void
++HnswPQEncodeVector(uint8 *dst, Datum v, HnswPQCentroidState *cstate, HnswSupport *support, int maxBytes)
++{
++	Vector *vec = DatumGetVector(v);
++	Vector *sv;
++
++	/* Initialize entire dst array with zeros */
++	memset(dst, 0, maxBytes);
++
++	/* Create temporary subvector for reuse */
++	sv = InitVector(cstate->subvectorDim);
++
++	/* Encode each subvector */
++	for (int i = 0; i < cstate->m; i++)
++	{
++		int			startDim = i * cstate->subvectorDim;
++		int			endDim = Min(startDim + cstate->subvectorDim, vec->dim);
++		int			subvectorDim = endDim - startDim;
++		VectorArray	centroids = cstate->centroids[i];
++		int			bestCentroid = -1;
++		float		bestDistance = FLT_MAX;
++
++		/* Update subvector dimension and copy data */
++		sv->dim = subvectorDim;
++
++		for (int d = 0; d < subvectorDim; d++)
++			sv->x[d] = vec->x[startDim + d];
++
++		/* Initialize padding elements with 0.0f (if any) */
++		for (int d = subvectorDim; d < cstate->subvectorDim; d++)
++			sv->x[d] = 0.0f;
++
++		/* Find nearest centroid */
++		for (int c = 0; c < HNSW_PQ_NUM_CENTROIDS; c++)
++		{
++			Vector	   *centroidVec = (Vector *) VectorArrayGet(centroids, c);
++			double		distance = HnswGetDistance(PointerGetDatum(sv), PointerGetDatum(centroidVec), support);
++
++			if (distance < bestDistance)
++			{
++				bestDistance = (float) distance;
++				bestCentroid = c;
++			}
++		}
++
++		Assert(bestCentroid >= 0 && bestCentroid < HNSW_PQ_NUM_CENTROIDS);
++
++		/* Store the index of the best centroid */
++		dst[i] = (uint8) bestCentroid;
++	}
++
++	pfree(sv);
++}
++
++/*
++ * Generic PQ decoding function
++ */
++void
++HnswPQDecodeVector(Datum dst, uint8 *encoded, HnswPQCentroidState *cstate, int dimensions)
++{
++	Vector *dv = DatumGetVector(dst);
++
++	for (int i = 0; i < cstate->m; i++)
++	{
++		int			startDim = i * cstate->subvectorDim;
++		int			endDim = Min(startDim + cstate->subvectorDim, dimensions);
++		int			subvectorDim = endDim - startDim;
++		uint8		centroidIdx = encoded[i];
++		VectorArray	centroids = cstate->centroids[i];
++
++		Assert(centroidIdx >= 0 && centroidIdx < HNSW_PQ_NUM_CENTROIDS);
++
++		/* Get the centroid vector */
++		Vector	   *centroidVec = (Vector *) VectorArrayGet(centroids, centroidIdx);
++		float	   *centroidData = centroidVec->x;
++
++		/* Copy centroid data to output vector (only actual dimensions, skip padding) */
++		for (int d = 0; d < subvectorDim; d++)
++			dv->x[startDim + d] = centroidData[d];
++	}
++}
++
++/*
++ * Train element PQ from residuals (when neighbor_metadata=on)
++ */
++static void
++TrainElementPQFromResiduals(Relation index, VectorArray samples, HnswBuildState * buildstate)
++{
++	HnswPQCentroidState	  *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(buildstate->pqState);
++	HnswPQCentroidState	  *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(buildstate->pqState);
++	VectorArray		rsamples;
++	Vector		   *tv;
++	Vector		   *rv;
++	int				itemSize;
++
++	/* Create array for residual samples */
++	itemSize = buildstate->typeInfo->itemSize(buildstate->dimensions);
++	rsamples = VectorArrayInit(samples->length, buildstate->dimensions, itemSize);
++	rsamples->length = samples->length;
++
++	/* Allocate reusable vectors outside the loop */
++	tv = InitVector(buildstate->dimensions);
++	rv = InitVector(buildstate->dimensions);
++
++	/* For each sample, compute residual vector */
++	for (int i = 0; i < samples->length; i++)
++	{
++		Vector *v = (Vector *) VectorArrayGet(samples, i);
++		uint8	encoded[HNSW_NEIGHBOR_METADATA_BYTES];
++
++		/* Step 1: Encode original vector with neighbor PQ */
++		HnswPQEncodeVector(encoded, PointerGetDatum(v), nstate, &buildstate->support, HNSW_NEIGHBOR_METADATA_BYTES);
++
++		/* Step 2: Reconstruct vector from neighbor PQ codes */
++		HnswPQDecodeVector(PointerGetDatum(tv), encoded, nstate, tv->dim);
++
++		/* Step 3: Compute residual = original - reconstructed */
++		for (int d = 0; d < v->dim; d++)
++			rv->x[d] = v->x[d] - tv->x[d];
++
++		/* Store residual in samples array */
++		VectorArraySet(rsamples, i, DatumGetPointer(PointerGetDatum(rv)));
++	}
++
++	/* Free reusable vectors */
++	pfree(tv);
++	pfree(rv);
++
++	/* Train PQ centroids on residual vectors */
++	TrainPQCentroids(index, rsamples, estate, buildstate);
++
++	/* Free residual samples */
++	VectorArrayFree(rsamples);
++}
++
++/*
++ * Train element PQ directly on original vectors (when neighbor_metadata=off)
++ */
++static void
++TrainElementPQDirectly(Relation index, VectorArray samples, HnswBuildState * buildstate)
++{
++	HnswPQCentroidState *state = HNSW_PQ_ELEMENT_COMPRESSION_STATE(buildstate->pqState);
++	TrainPQCentroids(index, samples, state, buildstate);
++}
++
++/* Initialize Element PQ centroids */
++static void
++InitElementPQCentroids(Relation index, HnswBuildState * buildstate)
++{
++	VectorArray		samples = (VectorArray) buildstate->samples;
++	HnswPQState	   *pqstate = (HnswPQState *) buildstate->pqState;
++	HnswPQCentroidState	   *cstate;
++
++	cstate = InitCentroidState();
++	pqstate->elementCompressionState = cstate;
++
++	/* Element PQ parameters: fixed subvector size with variable m */
++	cstate->subvectorDim = HNSW_ELEMENT_PQ_SUBVECTOR_DIM;
++	cstate->m = (buildstate->dimensions + HNSW_ELEMENT_PQ_SUBVECTOR_DIM - 1) / HNSW_ELEMENT_PQ_SUBVECTOR_DIM;
++
++	/* Train PQ centroids using pre-initialized samples */
++	if (buildstate->hasNeighborMetadata)
++	{
++		/* Residual PQ approach: Train on the difference between original vectors and PQ-approximated vectors */
++		TrainElementPQFromResiduals(index, samples, buildstate);
++	}
++	else
++	{
++		/* Direct PQ approach: train directly on original vectors */
++		TrainElementPQDirectly(index, samples, buildstate);
++	}
++}
++
++/*
++ * Initialize PQ state for neighbor metadata and element compression
++ */
++void
++HnswInitPQState(Relation index, HnswBuildState * buildstate)
++{
++	bool hasPqState = buildstate->hasNeighborMetadata || buildstate->enableCompression;
++
++	if (hasPqState)
++	{
++		buildstate->pqState = (HnswPQState *) palloc0(sizeof(HnswPQState));
++
++		/* Initialize samples first - shared between neighbor and element PQ */
++		InitializeSamples(buildstate);
++
++		/* Initialize neighbor metadata state if enabled */
++		if (buildstate->hasNeighborMetadata)
++			InitNeighborPQCentroids(index, buildstate);
++
++		/* Initialize element compression state if enabled */
++		if (buildstate->enableCompression)
++			InitElementPQCentroids(index, buildstate);
++
++		VectorArrayFree(buildstate->samples);
++	}
++	else
++	{
++		buildstate->pqState = NULL;
++	}
++}
++
++static void
++FreePQState(HnswPQCentroidState * pqstate)
++{
++	for (int i = 0; i < pqstate->m; i++)
++		VectorArrayFree(pqstate->centroids[i]);
++
++	if (pqstate)
++		pfree(pqstate);
++}
++
++/*
++ * Free PQ state for both neighbor metadata and element compression
++ */
++void
++HnswFreePQState(HnswBuildState * buildstate)
++{
++	HnswPQState *pqstate = (HnswPQState *) buildstate->pqState;
++
++	if (pqstate->neighborMetadataState)
++		FreePQState(pqstate->neighborMetadataState);
++
++	if (pqstate->elementCompressionState)
++		FreePQState(pqstate->elementCompressionState);
++}
++
++static bool
++CheckSupportFunctionName(FmgrInfo *distanceProcinfo, const char *targetFuncname)
++{
++	Oid				funcoid = distanceProcinfo->fn_oid;
++	HeapTuple		proctup;
++	Form_pg_proc	procform;
++	char		   *funcname = NULL;
++	bool			result = false;
++
++	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcoid));
++	if (!HeapTupleIsValid(proctup))
++		return false;
++
++	procform = (Form_pg_proc) GETSTRUCT(proctup);
++	funcname = NameStr(procform->proname);
++
++	result = strcmp(funcname, targetFuncname) == 0;
++
++	ReleaseSysCache(proctup);
++
++	return result;
++}
++
++/*
++ * TODO Smarter way to handle distance-specific optimization?
++ */
++bool
++HnswIsVectorL2Distance(FmgrInfo * distanceProcinfo)
++{
++	/*
++	 * vector_l2_ops uses vector_l2_squared_distance() as a distance function as follows:
++	 *
++	 * CREATE OPERATOR CLASS vector_l2_ops
++	 * 	DEFAULT FOR TYPE vector USING ivfflat AS
++	 * 	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
++	 * 	FUNCTION 1 vector_l2_squared_distance(vector, vector),
++	 * 	FUNCTION 3 l2_distance(vector, vector);
++	 */
++	return CheckSupportFunctionName(distanceProcinfo, "vector_l2_squared_distance");
++}
++
++/*
++ * Get the size of a vector item (Copied from ivfutils.c#VectorItemSize)
++ */
++Size
++HnswVectorItemSize(int dimensions)
++{
++	return VECTOR_SIZE(dimensions);
++}
++
++/*
++ * Update center vector from sum vector (Copied from ivfutils.c#VectorUpdateCenter)
++ */
++void
++HnswVectorUpdateCenter(Pointer v, int dimensions, float *x)
++{
++	Vector *vec = (Vector *) v;
++
++	SET_VARSIZE(vec, VECTOR_SIZE(dimensions));
++	vec->dim = dimensions;
++
++	for (int k = 0; k < dimensions; k++)
++		vec->x[k] = x[k];
++}
++
++/*
++ * Sum vector into x (Copied from ivfutils.c#VectorSumCenter)
++ */
++void
++HnswVectorSumCenter(Pointer v, float *x)
++{
++	Vector *vec = (Vector *) v;
++
++	for (int k = 0; k < vec->dim; k++)
++		x[k] += vec->x[k];
++}
++
++/*
++ * Load centroid data from pages
++ */
++static void
++LoadCentroidsFromPages(Relation index, BlockNumber startBlkno, uint16 pageCount, HnswPQCentroidState * pqstate)
++{
++	for (uint16 p = 0; p < pageCount; p++)
++	{
++		Buffer buf = ReadBuffer(index, startBlkno + p);
++		LockBuffer(buf, BUFFER_LOCK_SHARE);
++		Page page = BufferGetPage(buf);
++
++		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
++		for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoff; offno = OffsetNumberNext(offno))
++		{
++			ItemId				iid = PageGetItemId(page, offno);
++			HnswCentroidTuple 	ctup = (HnswCentroidTuple) PageGetItem(page, iid);
++
++			if (ctup->type == HNSW_CENTROID_TUPLE_TYPE)
++			{
++				/* Store centroid data in VectorArray */
++				VectorArray subvectorCentroids = pqstate->centroids[ctup->subvectorIndex];
++				Vector *centroid = (Vector *) VectorArrayGet(subvectorCentroids, ctup->centroidIndex);
++				memcpy(centroid, &ctup->data, VECTOR_SIZE(ctup->dimensions));
++			}
++		}
++
++		UnlockReleaseBuffer(buf);
++	}
++}
++
++void
++HnswSetVectorL2NeighborMetadata(char *dst, Datum v, void * pqstate, HnswSupport * support) {
++	Assert(DatumGetPointer(v) != NULL);
++	HnswPQEncodeVector((uint8 *) dst, v, HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate), support, HNSW_NEIGHBOR_METADATA_BYTES);
++}
++
++void
++HnswEstimateVectorL2Distances(Datum q, HnswNeighborEntry entries, int *unvisitedIndexes, int count, void * pqstate, HnswSupport * support) {
++	uint8	encoded[HNSW_NEIGHBOR_METADATA_BYTES];
++	Vector *qv = DatumGetVector(q);
++	Vector *decoded;
++
++	Assert(qv != NULL);
++
++	decoded = InitVector(qv->dim);
++
++	for (int i = 0; i < count; i++)
++	{
++		HnswNeighborEntry entry = &entries[unvisitedIndexes[i]];
++
++		if (!ItemPointerIsValid(&entry->indextid))
++			break;
++
++		memcpy(&encoded[0], entry->metadata, HNSW_NEIGHBOR_METADATA_BYTES);
++		HnswPQDecodeVector(PointerGetDatum(decoded), &encoded[0], HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate), decoded->dim);
++
++		entry->distance = HnswGetDistance(PointerGetDatum(decoded), q, support);
++	}
++
++	pfree(decoded);
++}
++
++/*
++ * Estimate size for a single PQ state
++ */
++static Size
++EstimatePQStateSize(HnswPQCentroidState *pqState)
++{
++	Size size = 0;
++
++	if (pqState == NULL)
++		return 0;
++
++	/* Add PQ state header size */
++	size = add_size(size, BUFFERALIGN(sizeof(HnswSharedPQState)));
++
++	/* Add centroids data size */
++	for (int m = 0; m < pqState->m; m++)
++	{
++		VectorArray subvectorCentroids = pqState->centroids[m];
++		size = add_size(size, subvectorCentroids->itemsize * subvectorCentroids->maxlen);
++	}
++
++	return size;
++}
++
++/*
++ * Estimate size of PQ state for shared memory
++ */
++Size
++HnswEstimateSharedPQState(HnswBuildState * buildstate)
++{
++	HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(buildstate->pqState);
++	HnswPQCentroidState *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(buildstate->pqState);
++	Size size = 0;
++
++	if ((nstate != NULL || estate != NULL))
++	{
++		/* Add header size */
++		size = add_size(size, BUFFERALIGN(sizeof(HnswSharedPQInfo)));
++
++		/* Add neighbor metadata and element compression state size */
++		size = add_size(size, EstimatePQStateSize(nstate));
++		size = add_size(size, EstimatePQStateSize(estate));
++	}
++
++	return size;
++}
++
++/*
++ * Copy a single PQ state to shared memory area
++ */
++static Size
++CopyCentroidStateToShm(char *destArea, HnswPQCentroidState *pqState)
++{
++	HnswSharedPQState *sharedPQState;
++	char *centroidsArea;
++	Size centroidsSize = 0;
++
++	if (pqState == NULL)
++		return 0;
++
++	/* Build PQ state header */
++	sharedPQState = (HnswSharedPQState *) destArea;
++	sharedPQState->m = pqState->m;
++	sharedPQState->subvectorDim = pqState->subvectorDim;
++	sharedPQState->centroidsOffset = BUFFERALIGN(sizeof(HnswSharedPQState));
++
++	/* Copy centroids data */
++	centroidsArea = destArea + sharedPQState->centroidsOffset;
++	for (int m = 0; m < pqState->m; m++)
++	{
++		VectorArray subvectorCentroids = pqState->centroids[m];
++		Size subvectorSize = subvectorCentroids->itemsize * subvectorCentroids->maxlen;
++
++		memcpy(centroidsArea + centroidsSize, subvectorCentroids->items, subvectorSize);
++		centroidsSize += subvectorSize;
++	}
++	sharedPQState->centroidsSize = centroidsSize;
++
++	return BUFFERALIGN(sizeof(HnswSharedPQState)) + centroidsSize;
++}
++
++/*
++ * Copy PQ state to shared memory
++ */
++char *
++HnswCopyPQStateToShm(ParallelContext * pcxt, HnswBuildState * buildstate, Size estpq)
++{
++	HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(buildstate->pqState);
++	HnswPQCentroidState *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(buildstate->pqState);
++	HnswSharedPQInfo *sharedpqinfo;
++	char   *shared;
++	char   *currentArea;
++	Size	currentOffset;
++
++	shared = shm_toc_allocate(pcxt->toc, estpq);
++
++	/* Build shared PQ state header */
++	sharedpqinfo = (HnswSharedPQInfo *) shared;
++	sharedpqinfo->totalSize = estpq;
++
++	currentOffset = BUFFERALIGN(sizeof(HnswSharedPQInfo));
++	currentArea = shared + currentOffset;
++
++	/* Copy neighbor metadata state if exists */
++	if (nstate != NULL)
++	{
++		sharedpqinfo->neighborMetadataOffset = currentOffset;
++		Size stateSize = CopyCentroidStateToShm(currentArea, nstate);
++		currentOffset += stateSize;
++		currentArea = shared + currentOffset;
++	}
++	else
++	{
++		sharedpqinfo->neighborMetadataOffset = 0;
++	}
++
++	/* Copy element compression state if exists */
++	if (estate != NULL)
++	{
++		sharedpqinfo->elementCompressionOffset = currentOffset;
++		CopyCentroidStateToShm(currentArea, estate);
++	}
++	else
++	{
++		sharedpqinfo->elementCompressionOffset = 0;
++	}
++
++	return shared;
++}
++
++/*
++ * Load a single PQ state from shared memory
++ */
++static HnswPQCentroidState *
++LoadCentroidStateFromShm(HnswSharedPQState *sharedPQState, const HnswTypeInfo * typeInfo)
++{
++	HnswPQCentroidState *pqState;
++	char *centroidsArea;
++	Size offset = 0;
++
++	if (sharedPQState == NULL)
++		return NULL;
++
++	/* Allocate local PQ state */
++	pqState = palloc(sizeof(HnswPQCentroidState));
++	pqState->m = sharedPQState->m;
++	pqState->subvectorDim = sharedPQState->subvectorDim;
++	pqState->centroids = palloc(sizeof(VectorArray) * pqState->m);
++
++	/* Restore centroids from shared memory */
++	centroidsArea = (char *) sharedPQState + sharedPQState->centroidsOffset;
++
++	for (int m = 0; m < pqState->m; m++)
++	{
++		VectorArray subvectorCentroids;
++		Size subvectorSize;
++
++		pqState->centroids[m] = VectorArrayInit(HNSW_PQ_NUM_CENTROIDS, pqState->subvectorDim, typeInfo->itemSize(pqState->subvectorDim));
++		subvectorCentroids = pqState->centroids[m];
++		subvectorSize = subvectorCentroids->itemsize * subvectorCentroids->maxlen;
++
++		memcpy(subvectorCentroids->items, centroidsArea + offset, subvectorSize);
++		subvectorCentroids->length = subvectorCentroids->maxlen;
++		offset += subvectorSize;
++	}
++
++	return pqState;
++}
++
++/*
++ * Load PQ state (both neighbor metadata and element compression) from shared memory
++ */
++void
++HnswLoadPQStateFromShm(char *shared, HnswBuildState * buildstate, HnswShared * sharedstate)
++{
++	HnswPQState		   *pqstate;
++	HnswSharedPQInfo   *sharedpqinfo = (HnswSharedPQInfo *) shared;
++
++	Assert(sharedstate->hasPqState);
++
++	pqstate = (HnswPQState *) palloc0(sizeof(HnswPQState));
++	buildstate->pqState = pqstate;
++
++	/* Load neighbor metadata state if exists */
++	if (sharedpqinfo->neighborMetadataOffset > 0)
++	{
++		HnswSharedPQState *sharednstate = (HnswSharedPQState *) (shared + sharedpqinfo->neighborMetadataOffset);
++		pqstate->neighborMetadataState = LoadCentroidStateFromShm(sharednstate, buildstate->typeInfo);
++	}
++
++	/* Load element compression state if exists */
++	if (sharedpqinfo->elementCompressionOffset > 0)
++	{
++		HnswSharedPQState *sharedestate = (HnswSharedPQState *) (shared + sharedpqinfo->elementCompressionOffset);
++		pqstate->elementCompressionState = LoadCentroidStateFromShm(sharedestate, buildstate->typeInfo);
++	}
++}
++
++/*
++ * Create centroid pages for neighbor metadata
++ */
++static BlockNumber
++HnswCreateCodebookPages(HnswBuildState * buildstate, HnswPQCentroidState * cstate, uint16 *pageCount)
++{
++	Relation	index = buildstate->index;
++	ForkNumber	forkNum = buildstate->forkNum;
++	Buffer		buf;
++	Page		page;
++	BlockNumber startBlkno;
++	uint16		pagesUsed = 0;
++	HnswCentroidTuple	ctup;
++
++	/* Allocate memory for centroid tuple */
++	ctup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
++
++	/* Create first page */
++	buf = HnswNewBuffer(index, forkNum);
++	page = BufferGetPage(buf);
++	HnswInitPage(buf, page);
++	startBlkno = BufferGetBlockNumber(buf);
++	pagesUsed = 1;
++
++	/* Write centroids for each subvector */
++	for (int m = 0; m < cstate->m; m++)
++	{
++		VectorArray subvectorCentroids = cstate->centroids[m];
++
++		for (int c = 0; c < HNSW_PQ_NUM_CENTROIDS; c++)
++		{
++			Vector *centroid = (Vector *) VectorArrayGet(subvectorCentroids, c);
++			Size	ctupSize = HNSW_CENTROID_TUPLE_SIZE(centroid->dim);
++
++			/* Create new page if current page doesn't have enough space */
++			if (PageGetFreeSpace(page) < ctupSize)
++			{
++				/* Commit current page */
++				MarkBufferDirty(buf);
++				UnlockReleaseBuffer(buf);
++
++				/* Create new page */
++				buf = HnswNewBuffer(index, forkNum);
++				page = BufferGetPage(buf);
++				HnswInitPage(buf, page);
++				pagesUsed++;
++			}
++
++			/* Set centroid tuple */
++			MemSet(ctup, 0, HNSW_TUPLE_ALLOC_SIZE);
++			ctup->type = HNSW_CENTROID_TUPLE_TYPE;
++			ctup->subvectorIndex = m;
++			ctup->centroidIndex = c;
++			ctup->dimensions = centroid->dim;
++			memcpy(&ctup->data, centroid, VECTOR_SIZE(centroid->dim));
++
++			/* Add to page */
++			if (PageAddItem(page, (Item) ctup, ctupSize, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
++				elog(ERROR, "failed to add centroid item to \"%s\"", RelationGetRelationName(index));
++		}
++	}
++
++	/* Commit last page */
++	MarkBufferDirty(buf);
++	UnlockReleaseBuffer(buf);
++
++	pfree(ctup);
++
++	*pageCount = pagesUsed;
++
++	return startBlkno;
++}
++
++uint16
++HnswCreatePQPages(HnswBuildState * buildstate, HnswPQPages * pqpages)
++{
++	HnswPQState *pqstate = (HnswPQState *) buildstate->pqState;
++	HnswPQCodebookPageData *nc = &pqpages->nCodebookPages;
++	HnswPQCodebookPageData *ec = &pqpages->eCodebookPages;
++
++	pqpages->hasPqState = pqstate->neighborMetadataState != NULL || pqstate->elementCompressionState != NULL;
++
++	if (pqstate->neighborMetadataState != NULL)
++	{
++		HnswPQCentroidState    *cstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate);
++
++		/* Create centroid pages and record start page number */
++		nc->startBlkno = HnswCreateCodebookPages(buildstate, cstate, &nc->pageCount);
++		nc->subvectorDim = cstate->subvectorDim;
++		nc->m = cstate->m;
++	}
++	else
++	{
++		nc->startBlkno = InvalidBlockNumber;
++		nc->pageCount = 0;
++		nc->subvectorDim = 0;
++		nc->m = 0;
++	}
++
++	if (pqstate->elementCompressionState != NULL)
++	{
++		HnswPQCentroidState    *cstate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
++
++		/* Create centroid pages and record start page number */
++		ec->startBlkno = HnswCreateCodebookPages(buildstate, cstate, &ec->pageCount);
++		ec->subvectorDim = cstate->subvectorDim;
++		ec->m = cstate->m;
++	}
++	else
++	{
++		ec->subvectorDim = 0;
++		ec->m = 0;
++		ec->startBlkno = InvalidBlockNumber;
++		ec->pageCount = 0;
++	}
++
++	return nc->pageCount + ec->pageCount;
++}
++
++/*
++ * Load neighbor metadata state from index metapage and centroid pages
++ */
++HnswPQState *
++HnswLoadPQStateFromDisk(Relation index)
++{
++	Buffer			buf;
++	Page			page;
++	HnswMetaPage 	metap;
++	HnswPQPages		pqpages;
++	HnswPQState	   *pqstate;
++	const HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
++
++	/* Read metapage */
++	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
++	LockBuffer(buf, BUFFER_LOCK_SHARE);
++	page = BufferGetPage(buf);
++	metap = HnswPageGetMeta(page);
++
++	/* Since PQ pages are immutable, copy to local variable */
++	pqpages = metap->pqPages;
++
++	UnlockReleaseBuffer(buf);
++
++	if (!pqpages.hasPqState)
++		return NULL;
++
++	/* Initialize PQState */
++	pqstate = palloc0(sizeof(HnswPQState));
++
++	/* Load neighbor metadata state if exists */
++	if (pqpages.nCodebookPages.pageCount > 0)
++	{
++		HnswPQCentroidState *nstate;
++
++		nstate = InitCentroidState();
++		nstate->subvectorDim = pqpages.nCodebookPages.subvectorDim;
++		nstate->m = pqpages.nCodebookPages.m;
++		nstate->centroids = palloc0(sizeof(VectorArray) * nstate->m);
++
++		/* Initialize centroid arrays for each subvector */
++		for (int m = 0; m < nstate->m; m++)
++		{
++			Size	itemsize = typeInfo->itemSize(nstate->subvectorDim);
++			nstate->centroids[m] = VectorArrayInit(HNSW_PQ_NUM_CENTROIDS, nstate->subvectorDim, itemsize);
++		}
++
++		/* Load centroid data from pages */
++		LoadCentroidsFromPages(index, pqpages.nCodebookPages.startBlkno, pqpages.nCodebookPages.pageCount, nstate);
++
++		pqstate->neighborMetadataState = nstate;
++	}
++
++	/* Load element compression state if exists */
++	if (pqpages.eCodebookPages.pageCount > 0)
++	{
++		HnswPQCentroidState *estate;
++
++		estate = InitCentroidState();
++		estate->subvectorDim = pqpages.eCodebookPages.subvectorDim;
++		estate->m = pqpages.eCodebookPages.m;
++		estate->centroids = palloc0(sizeof(VectorArray) * estate->m);
++
++		/* Initialize centroid arrays for each subvector */
++		for (int m = 0; m < estate->m; m++)
++		{
++			Size	itemsize = typeInfo->itemSize(estate->subvectorDim);
++			estate->centroids[m] = VectorArrayInit(HNSW_PQ_NUM_CENTROIDS, estate->subvectorDim, itemsize);
++		}
++
++		/* Load centroid data from pages */
++		LoadCentroidsFromPages(index, pqpages.eCodebookPages.startBlkno, pqpages.eCodebookPages.pageCount, estate);
++
++		pqstate->elementCompressionState = estate;
++	}
++
++	return pqstate;
++}
++
++/*
++ * Compress element data using PQ compression
++ */
++void
++HnswCompressAndCopyElementData(char *dst, Datum v, HnswSupport * support, HnswPQState * pqstate)
++{
++	HnswPQCentroidState *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
++	Vector *vec = DatumGetVector(v);
++
++	/* This function is only used when elements need to be compressed */
++	Assert(HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(pqstate));
++
++	if (HNSW_PQ_NEIGHBOR_METADATA_EXISTS(pqstate))
++	{
++		/* Residual PQ approach: Train on the difference between original vectors and PQ-approximated vectors */
++		HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate);
++		Vector *tv = InitVector(vec->dim);
++		Vector *rv = InitVector(vec->dim);
++		uint8	encoded[HNSW_NEIGHBOR_METADATA_BYTES];
++
++		/* Step 1: Compress original vector with neighbor PQ */
++		HnswPQEncodeVector(encoded, PointerGetDatum(vec), nstate, support, HNSW_NEIGHBOR_METADATA_BYTES);
++
++		/* Step 2: Reconstruct and compute residual */
++		HnswPQDecodeVector(PointerGetDatum(tv), encoded, nstate, vec->dim);
++		for (int i = 0; i < vec->dim; i++)
++			rv->x[i] = vec->x[i] - tv->x[i];
++
++		/* Step 3: Compress residual with element PQ */
++		HnswPQEncodeVector((uint8 *) dst, PointerGetDatum(rv), estate, support, estate->m);
++
++		pfree(tv);
++		pfree(rv);
++	}
++	else
++	{
++		/* Direct PQ approach: compress original vector with element PQ */
++		HnswPQEncodeVector((uint8 *) dst, PointerGetDatum(vec), estate, support, estate->m);
++	}
++}
++
++/*
++ * Reconstruct vector from compressed element tuple
++ */
++Datum
++HnswLoadVectorFromCompressedTuple(HnswElementTuple etup, Relation index, HnswSupport * support, HnswPQState * pqstate, char *neighborMetadata)
++{
++	Vector	   *result;
++	int			dimensions;
++
++	/* Initialize result vector */
++	dimensions = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
++	result = InitVector(dimensions);
++
++	/* Check compression type and reconstruct accordingly */
++	if (pqstate->neighborMetadataState != NULL)
++	{
++		/* Residual PQ approach (neighbor_metadata=on) */
++		Vector		*tv = InitVector(dimensions);
++		Vector		*rv = InitVector(dimensions);
++		HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate);
++		HnswPQCentroidState *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
++
++		/* Get neighbor PQ codes from neighbor entry metadata */
++		HnswPQDecodeVector(PointerGetDatum(tv), (uint8 *) neighborMetadata, nstate, dimensions);
++
++		/* Reconstruct residual vector from element PQ codes */
++		HnswPQDecodeVector(PointerGetDatum(rv), (uint8 *) etup->data, estate, dimensions);
++
++		/* Combine: result = neighborReconstructed + residualReconstructed */
++		for (int i = 0; i < dimensions; i++)
++			result->x[i] = tv->x[i] + rv->x[i];
++
++		pfree(tv);
++		pfree(rv);
++	}
++	else
++	{
++		/* Direct PQ approach (neighbor_metadata=off) */
++		HnswPQCentroidState *estate = pqstate->elementCompressionState;
++		HnswPQDecodeVector(PointerGetDatum(result), (uint8 *) etup->data, estate, dimensions);
++	}
++
++	return PointerGetDatum(result);
++}
++
++/*
++ * Load original vector from heap tuple for vacuum operations
++ */
++Datum
++LoadVectorFromHeap(HnswElement element, Relation heap, Relation index, HnswSupport *support)
++{
++#if PG_VERSION_NUM < 170000
++	HeapTuple	heapTuple;
++#endif
++	TupleDesc	tupleDesc;
++	AttrNumber	vectorAttno;
++	Datum		vd;
++	Vector	   *v = NULL;
++	bool		isnull;
++
++	/* Get the first valid heap TID */
++	if (element->heaptidsLength == 0 || !ItemPointerIsValid(&element->heaptids[0]))
++		return PointerGetDatum(NULL);
++
++#if PG_VERSION_NUM >= 170000
++	{
++		HeapTupleData htup;
++		Buffer		buf = InvalidBuffer;
++		bool		found;
++
++		/* Initialize temporary HeapTupleData with target TID */
++		htup.t_self = element->heaptids[0];
++
++		found = heap_fetch(heap, SnapshotAny, &htup, &buf, false);
++		if (!found)
++			return PointerGetDatum(NULL);
++
++		tupleDesc = RelationGetDescr(heap);
++
++		/* Use first column from index definition */
++		vectorAttno = index->rd_index->indkey.values[0];
++
++		vd = heap_getattr(&htup, vectorAttno, tupleDesc, &isnull);
++
++		if (!isnull)
++		{
++			Vector *sv = DatumGetVector(vd);
++			v = InitVector(sv->dim);
++			memcpy(v, sv, VARSIZE(sv));
++		}
++
++		/* Release buffer acquired by heap_fetch */
++		if (BufferIsValid(buf))
++			ReleaseBuffer(buf);
++
++		return PointerGetDatum(v);
++	}
++#else
++	/* Fetch heap tuple (pre-17 API expects to return HeapTuple) */
++	heapTuple = heap_fetch(heap, SnapshotAny, &element->heaptids[0], NULL, false);
++	if (!HeapTupleIsValid(heapTuple))
++		return PointerGetDatum(NULL);
++
++	tupleDesc = RelationGetDescr(heap);
++	vectorAttno = index->rd_index->indkey.values[0];
++	vd = heap_getattr(heapTuple, vectorAttno, tupleDesc, &isnull);
++
++	if (!isnull)
++	{
++		Vector *sv = DatumGetVector(vd);
++		v = InitVector(sv->dim);
++		memcpy(v, sv, VARSIZE(sv));
++	}
++
++	heap_freetuple(heapTuple);
++
++	return PointerGetDatum(v);
++#endif
++}
+\ No newline at end of file
+diff --git a/src/hnswpq.h b/src/hnswpq.h
+new file mode 100644
+index 0000000..254d8c9
+--- /dev/null
++++ b/src/hnswpq.h
+@@ -0,0 +1,101 @@
++#ifndef HNSW_SIMHASH_H
++#define HNSW_SIMHASH_H
++
++/* TODO This header file can be merged with hnsw.h */
++#include "postgres.h"
++
++#include "access/parallel.h"
++#include "hnsw.h"
++#include "ivfflat.h"			/* For reusing some structs and functions */
++#include "utils/relcache.h"
++
++/*
++ * Product Quantization
++ *
++ * NOTE HNSW_PQ_NUM_CENTROIDS must be 256 (2^8) because centroid indices are stored as uint8.
++ * Changing this value will break compatibility and require updates to
++ * encoding/decoding functions and storage format.
++ */
++#define HNSW_PQ_NUM_CENTROIDS			256 /* Number of centroids per sub-vector */
++#define HNSW_ELEMENT_PQ_SUBVECTOR_DIM	8	/* Fixed subvector dimension for element compression */
++
++/* Compile-time check to ensure HNSW_PQ_NUM_CENTROIDS fits in uint8 */
++#if HNSW_PQ_NUM_CENTROIDS > 256
++#error "HNSW_PQ_NUM_CENTROIDS must not exceed 256 due to uint8 storage limitation"
++#endif
++
++/* Utility macros */
++#define HNSW_CENTROID_TUPLE_SIZE(dimensions)	MAXALIGN(offsetof(HnswCentroidTupleData, data) + VECTOR_SIZE(dimensions))
++
++#define HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate)		(((pqstate) != NULL)? (((HnswPQState *) (pqstate))->neighborMetadataState) : NULL)
++#define HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate)		(((pqstate) != NULL)? (((HnswPQState *) (pqstate))->elementCompressionState) : NULL)
++#define HNSW_PQ_NEIGHBOR_METADATA_EXISTS(pqstate)		(((pqstate) != NULL && ((HnswPQState *) (pqstate))->neighborMetadataState != NULL))
++#define HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(pqstate)	(((pqstate) != NULL && ((HnswPQState *) (pqstate))->elementCompressionState != NULL))
++#define HNSW_PQ_RESIDUAL_COMPRESSION_ENABLED(pqstate)	(HNSW_PQ_NEIGHBOR_METADATA_EXISTS(pqstate) && HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(pqstate))
++
++#define HnswVectorIsLoaded(base, element) (DatumGetPointer(HnswGetValue((base), (element))) != NULL)
++
++/* As post-processing of HNSW search, recheck data points whose distance to query q has been estimated */
++#define HNSW_SCAN_ESTIMATED_DISTANCE_QUEUE
++
++/* Generic PQ (Product Quantization) state */
++typedef struct HnswPQCentroidState {
++	int				subvectorDim;	/* Dimension of each sub-vector */
++	int				m;				/* Number of sub-vectors */
++	VectorArray    *centroids;		/* Centroids for each sub-vector, the number of centroids per sub-vector is HNSW_PQ_NUM_CENTROIDS */
++}			HnswPQCentroidState;
++
++typedef struct HnswPQState {
++	HnswPQCentroidState *neighborMetadataState;
++	HnswPQCentroidState *elementCompressionState;
++}			HnswPQState;
++
++typedef struct HnswSharedPQState
++{
++	int		subvectorDim;		/* Dimension of each sub-vector */
++	int		m;					/* Number of subvectors */
++	Size	centroidsOffset;	/* Offset to centroids data in shared memory */
++	Size	centroidsSize;		/* Total size of centroids data */
++}			HnswSharedPQState;
++
++typedef struct HnswSharedPQInfo
++{
++	Size	neighborMetadataOffset;		/* Offset to neighbor metadata in shared memory */
++	Size	elementCompressionOffset;	/* Offset to element compression in shared memory */
++	Size	totalSize;					/* Total size of all compression data */
++}			HnswSharedPQInfo;
++
++typedef struct HnswCentroidTupleData
++{
++	uint8		type;					/* HNSW_CENTROID_TUPLE_TYPE */
++	uint16		subvectorIndex;			/* subvector index */
++	uint16		centroidIndex;			/* centroid index within subvector */
++	uint16		dimensions;				/* dimensions of this centroid */
++	Vector		data;					/* centroid vector */
++}			HnswCentroidTupleData;
++
++typedef HnswCentroidTupleData * HnswCentroidTuple;
++
++/* Methods */
++bool	HnswSupportNeighborMetadata(Relation index);
++bool	HnswGetEnableCompression(Relation index);
++bool	HnswIsVectorL2Distance(FmgrInfo * distanceProcinfo);
++void	HnswSetVectorL2NeighborMetadata(char *dst, Datum v, void * pqstate, HnswSupport * support);
++void	HnswEstimateVectorL2Distances(Datum q, HnswNeighborEntry entries, int *unvisitedIndexes, int count, void * pqstate, HnswSupport * support);
++Size	HnswVectorItemSize(int dimensions);
++void	HnswVectorUpdateCenter(Pointer v, int dimensions, float *x);
++void	HnswVectorSumCenter(Pointer v, float *x);
++void	HnswInitPQState(Relation index, HnswBuildState * buildstate);
++void	HnswFreePQState(HnswBuildState * buildstate);
++Size	HnswEstimateSharedPQState(HnswBuildState * buildstate);
++char   *HnswCopyPQStateToShm(ParallelContext * pcxt, HnswBuildState * buildstate, Size estmeta);
++void	HnswLoadPQStateFromShm(char *shared, HnswBuildState * buildstate, HnswShared * sharedstate);
++uint16	HnswCreatePQPages(HnswBuildState * buildstate, HnswPQPages * pqpages);
++HnswPQState *HnswLoadPQStateFromDisk(Relation index);
++void	HnswCompressAndCopyElementData(char *dst, Datum v, HnswSupport * support, HnswPQState * pqstate);
++void	HnswPQEncodeVector(uint8 *dst, Datum v, HnswPQCentroidState * cstate, HnswSupport * support, int maxBytes);
++void	HnswPQDecodeVector(Datum dst, uint8 *encoded, HnswPQCentroidState * cstate, int dimensions);
++Datum	HnswLoadVectorFromCompressedTuple(HnswElementTuple etup, Relation index, HnswSupport * support, HnswPQState * pqstate, char *neighborMetadata);
++Datum	LoadVectorFromHeap(HnswElement element, Relation heap, Relation index, HnswSupport *support);
++
++#endif
+\ No newline at end of file
+diff --git a/src/hnswscan.c b/src/hnswscan.c
+index 955998a..6bf9f1e 100644
+--- a/src/hnswscan.c
++++ b/src/hnswscan.c
+@@ -2,6 +2,7 @@
+ 
+ #include "access/relscan.h"
+ #include "hnsw.h"
++#include "hnswpq.h"
+ #include "pgstat.h"
+ #include "storage/bufmgr.h"
+ #include "storage/lmgr.h"
+@@ -16,6 +17,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
+ {
+ 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+ 	Relation	index = scan->indexRelation;
++	const		HnswTypeInfo *typeInfo = so->typeInfo;
+ 	HnswSupport *support = &so->support;
+ 	List	   *ep;
+ 	List	   *w;
+@@ -23,9 +25,11 @@ GetScanItems(IndexScanDesc scan, Datum value)
+ 	HnswElement entryPoint;
+ 	char	   *base = NULL;
+ 	HnswQuery  *q = &so->q;
++	bool		residualCompressionEnabled = HNSW_PQ_RESIDUAL_COMPRESSION_ENABLED(so->pqState);
++	char		entryMetadata[HNSW_NEIGHBOR_METADATA_BYTES];
+ 
+ 	/* Get m and entry point */
+-	HnswGetMetaPageInfo(index, &m, &entryPoint);
++	HnswGetMetaPageInfo(index, &m, &entryPoint, residualCompressionEnabled ? entryMetadata : NULL);
+ 
+ 	q->value = value;
+ 	so->m = m;
+@@ -33,15 +37,15 @@ GetScanItems(IndexScanDesc scan, Datum value)
+ 	if (entryPoint == NULL)
+ 		return NIL;
+ 
+-	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
++	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false, so->pqState, residualCompressionEnabled ? entryMetadata : NULL));
+ 
+ 	for (int lc = entryPoint->level; lc >= 1; lc--)
+ 	{
+-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
++		w = HnswSearchLayer(base, q, ep, 1, lc, index, typeInfo, support, m, false, NULL, NULL, NULL, true, NULL, so->pqState, true);
+ 		ep = w;
+ 	}
+ 
+-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
++	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, typeInfo, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, so->pqState, true);
+ }
+ 
+ /*
+@@ -72,7 +76,7 @@ ResumeScanItems(IndexScanDesc scan)
+ 		ep = lappend(ep, sc);
+ 	}
+ 
+-	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
++	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, so->typeInfo, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, so->pqState, true);
+ }
+ 
+ /*
+@@ -131,6 +135,9 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
+ 	/* Set support functions */
+ 	HnswInitSupport(&so->support, index);
+ 
++	/* Load PQ state */
++	so->pqState = HnswLoadPQStateFromDisk(index);
++
+ 	/*
+ 	 * Use a lower max allocation size than default to allow scanning more
+ 	 * tuples for iterative search before exceeding work_mem
+diff --git a/src/hnswutils.c b/src/hnswutils.c
+index 7afed25..e927493 100644
+--- a/src/hnswutils.c
++++ b/src/hnswutils.c
+@@ -1,5 +1,6 @@
+ #include "postgres.h"
+ 
++#include <float.h>
+ #include <math.h>
+ 
+ #include "access/generic_xlog.h"
+@@ -8,6 +9,7 @@
+ #include "common/hashfn.h"
+ #include "fmgr.h"
+ #include "hnsw.h"
++#include "hnswpq.h"
+ #include "lib/pairingheap.h"
+ #include "sparsevec.h"
+ #include "storage/bufmgr.h"
+@@ -290,7 +292,7 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
+  * Get the metapage info
+  */
+ void
+-HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
++HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint, char *entryMetadata)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+@@ -313,6 +315,9 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
+ 		{
+ 			*entryPoint = HnswInitElementFromBlock(metap->entryBlkno, metap->entryOffno);
+ 			(*entryPoint)->level = metap->entryLevel;
++
++			if (entryMetadata != NULL)
++				memcpy(entryMetadata, metap->entryMetadata, HNSW_NEIGHBOR_METADATA_BYTES);
+ 		}
+ 		else
+ 			*entryPoint = NULL;
+@@ -325,20 +330,43 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
+  * Get the entry point
+  */
+ HnswElement
+-HnswGetEntryPoint(Relation index)
++HnswGetEntryPoint(Relation index, char *entryMetadata)
+ {
+ 	HnswElement entryPoint;
+ 
+-	HnswGetMetaPageInfo(index, NULL, &entryPoint);
++	HnswGetMetaPageInfo(index, NULL, &entryPoint, entryMetadata);
+ 
+ 	return entryPoint;
+ }
+ 
++/*
++ * Get head block number from meta page
++ */
++BlockNumber
++HnswGetHeadBlockNumber(Relation index)
++{
++	Buffer		buf;
++	Page		page;
++	HnswMetaPage metap;
++	BlockNumber headBlkno;
++
++	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
++	LockBuffer(buf, BUFFER_LOCK_SHARE);
++	page = BufferGetPage(buf);
++	metap = HnswPageGetMeta(page);
++
++	headBlkno = metap->headBlkno;
++
++	UnlockReleaseBuffer(buf);
++
++	return headBlkno;
++}
++
+ /*
+  * Update the metapage info
+  */
+ static void
+-HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, BlockNumber insertPage)
++HnswUpdateMetaPageInfo(Page page, int updateEntry, const HnswTypeInfo * typeInfo, HnswSupport * support, char *base, HnswElement entryPoint, BlockNumber insertPage, void * pqstate)
+ {
+ 	HnswMetaPage metap = HnswPageGetMeta(page);
+ 
+@@ -349,12 +377,24 @@ HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, Block
+ 			metap->entryBlkno = InvalidBlockNumber;
+ 			metap->entryOffno = InvalidOffsetNumber;
+ 			metap->entryLevel = -1;
++
++			memset(metap->entryMetadata, 0, HNSW_NEIGHBOR_METADATA_BYTES);
+ 		}
+ 		else if (entryPoint->level > metap->entryLevel || updateEntry == HNSW_UPDATE_ENTRY_ALWAYS)
+ 		{
+ 			metap->entryBlkno = entryPoint->blkno;
+ 			metap->entryOffno = entryPoint->offno;
+ 			metap->entryLevel = entryPoint->level;
++
++			/*
++			 * If both neighbor metadata and element compression are enabled, the element tuple has only
++			 * a PQ-encoded residual vector, so the original vector cannot be reconstructed without neighbor metadata.
++			 * Therefore, we store neighbor metadata in the meta page.
++			 */
++			if (HNSW_PQ_RESIDUAL_COMPRESSION_ENABLED(pqstate))
++				typeInfo->setNeighborMetadata(metap->entryMetadata, HnswGetValue(base, entryPoint), pqstate, support);
++			else
++				memset(metap->entryMetadata, 0, HNSW_NEIGHBOR_METADATA_BYTES);
+ 		}
+ 	}
+ 
+@@ -366,7 +406,7 @@ HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, Block
+  * Update the metapage
+  */
+ void
+-HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building)
++HnswUpdateMetaPage(Relation index, int updateEntry, const HnswTypeInfo * typeInfo, HnswSupport * support, char *base, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building, void * pqstate)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+@@ -385,7 +425,7 @@ HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, Bloc
+ 		page = GenericXLogRegisterBuffer(state, buf, 0);
+ 	}
+ 
+-	HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage);
++	HnswUpdateMetaPageInfo(page, updateEntry, typeInfo, support, base, entryPoint, insertPage, pqstate);
+ 
+ 	if (building)
+ 		MarkBufferDirty(buf);
+@@ -421,11 +461,23 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
+ 	return true;
+ }
+ 
++/*
++ * Calculate element tuple size based on PQ settings
++ */
++Size
++HnswCalculateElementTupleSize(void * pqstate, Datum v)
++{
++	if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(pqstate))
++		return HNSW_ELEMENT_TUPLE_PQ_COMPRESSED_SIZE(HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate)->m);
++	else
++		return HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(v));
++}
++
+ /*
+  * Set element tuple, except for neighbor info
+  */
+ void
+-HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
++HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, HnswSupport * support, void * pqstate)
+ {
+ 	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+ 
+@@ -440,15 +492,21 @@ HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
+ 		else
+ 			ItemPointerSetInvalid(&etup->heaptids[i]);
+ 	}
+-	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
++
++	/* Handle element compression based on PQ settings */
++	if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(pqstate))
++		HnswCompressAndCopyElementData(etup->data, PointerGetDatum(valuePtr), support, pqstate);
++	else
++		memcpy(etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+ }
+ 
+ /*
+  * Set neighbor tuple
+  */
+ void
+-HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
++HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m, const HnswTypeInfo * typeInfo, HnswSupport * support, void * pqstate)
+ {
++	bool		hasNeighborMetadata = HNSW_PQ_NEIGHBOR_METADATA_EXISTS(pqstate);
+ 	int			idx = 0;
+ 
+ 	ntup->type = HNSW_NEIGHBOR_TUPLE_TYPE;
+@@ -460,7 +518,8 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
+ 
+ 		for (int i = 0; i < lm; i++)
+ 		{
+-			ItemPointer indextid = &ntup->indextids[idx++];
++			int			cidx = idx++;
++			ItemPointer indextid = HnswNeighborEntryItemPointerAccess(ntup->entries, cidx, hasNeighborMetadata);
+ 
+ 			if (i < neighbors->length)
+ 			{
+@@ -468,6 +527,12 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
+ 				HnswElement hce = HnswPtrAccess(base, hc->element);
+ 
+ 				ItemPointerSet(indextid, hce->blkno, hce->offno);
++
++				if (hasNeighborMetadata)
++				{
++					char *metadata = HnswNeighborEntryMetadataAccess(ntup->entries, cidx, hasNeighborMetadata);
++					typeInfo->setNeighborMetadata(metadata, HnswGetValue(base, hce), pqstate, support);
++				}
+ 			}
+ 			else
+ 				ItemPointerSetInvalid(indextid);
+@@ -482,7 +547,7 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
+  * Load an element from a tuple
+  */
+ void
+-HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec)
++HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec, Relation index, HnswSupport * support, void * pqstate, char *neighborMetadata)
+ {
+ 	element->level = etup->level;
+ 	element->deleted = etup->deleted;
+@@ -505,10 +570,20 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
+ 
+ 	if (loadVec)
+ 	{
+-		char	   *base = NULL;
+-		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
+-
+-		HnswPtrStore(base, element->value, DatumGetPointer(value));
++		if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(pqstate))
++		{
++			Datum	tv = HnswLoadVectorFromCompressedTuple(etup, index, support, pqstate, neighborMetadata);
++			Datum	value = datumCopy(tv, false, -1);
++			char   *base = NULL;
++			HnswPtrStore(base, element->value, DatumGetPointer(value));
++			pfree(DatumGetPointer(tv));
++		}
++		else
++		{
++			char   *base = NULL;
++			Datum	value = datumCopy(PointerGetDatum(&etup->data), false, -1);
++			HnswPtrStore(base, element->value, DatumGetPointer(value));
++		}
+ 	}
+ }
+ 
+@@ -525,7 +600,7 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
+  * Load an element and optionally get its distance from q
+  */
+ static void
+-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
++HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, void * pqstate, char *neighborMetadata)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+@@ -546,7 +621,18 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
+ 		if (DatumGetPointer(q->value) == NULL)
+ 			*distance = 0;
+ 		else
+-			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
++		{
++			if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(pqstate))
++			{
++				Datum	tv = HnswLoadVectorFromCompressedTuple(etup, index, support, (HnswPQState *) pqstate, neighborMetadata);
++				*distance = HnswGetDistance(q->value, tv, support);
++				pfree(DatumGetPointer(tv));
++			}
++			else
++			{
++				*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
++			}
++		}
+ 	}
+ 
+ 	/* Load element */
+@@ -555,7 +641,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
+ 		if (*element == NULL)
+ 			*element = HnswInitElementFromBlock(blkno, offno);
+ 
+-		HnswLoadElementFromTuple(*element, etup, true, loadVec);
++		HnswLoadElementFromTuple(*element, etup, true, loadVec, index, support, pqstate, neighborMetadata);
+ 	}
+ 
+ 	UnlockReleaseBuffer(buf);
+@@ -565,9 +651,56 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
+  * Load an element and optionally get its distance from q
+  */
+ void
+-HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
++HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, void * pqstate, char *neighborMetadata)
++{
++	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, pqstate, neighborMetadata);
++}
++
++static void
++LoadElementInSearchCandidate(char *base, HnswSearchCandidate *c, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, HnswPQState *pqstate)
+ {
+-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
++	HnswElement element = NULL;
++	BlockNumber blkno = ItemPointerGetBlockNumber(&c->indextid);
++	OffsetNumber offno = ItemPointerGetOffsetNumber(&c->indextid);
++	Assert(HnswPtrIsNull(base, c->element));
++	HnswLoadElementImpl(blkno, offno, &c->distance, q, index, support, loadVec, NULL, &element, pqstate, c->neighborMetadata);
++	HnswPtrStore(base, c->element, element);
++}
++
++static void
++LoadVectorInElement(Relation index, HnswElement element, void * pqstate, char *neighborMetadata)
++{
++	Buffer  buf;
++	Page    page;
++	HnswElementTuple etup;
++	Datum   vec;
++	char   *base = NULL;
++
++	Assert(element->value == NULL);
++
++	/* Read vector */
++	buf = ReadBuffer(index, element->blkno);
++	LockBuffer(buf, BUFFER_LOCK_SHARE);
++	page = BufferGetPage(buf);
++
++	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, element->offno));
++
++	Assert(HnswIsElementTuple(etup));
++
++	if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(pqstate))
++	{
++		Datum	tv = HnswLoadVectorFromCompressedTuple(etup, index, NULL, pqstate, neighborMetadata);
++		vec = datumCopy(tv, false, -1);
++		HnswPtrStore(base, element->value, DatumGetPointer(vec));
++		pfree(DatumGetPointer(tv));
++	}
++	else
++	{
++		vec = datumCopy(PointerGetDatum(&etup->data), false, -1);
++		HnswPtrStore(base, element->value, DatumGetPointer(vec));
++	}
++
++	UnlockReleaseBuffer(buf);
+ }
+ 
+ /*
+@@ -585,12 +718,33 @@ GetElementDistance(char *base, HnswElement element, HnswQuery * q, HnswSupport *
+  * Allocate a search candidate
+  */
+ static HnswSearchCandidate *
+-HnswInitSearchCandidate(char *base, HnswElement element, double distance)
++HnswInitSearchCandidate(char *base, HnswElement element, double distance, char *neighborMetadata)
+ {
+ 	HnswSearchCandidate *sc = palloc(sizeof(HnswSearchCandidate));
+ 
+ 	HnswPtrStore(base, sc->element, element);
+ 	sc->distance = distance;
++
++	if (neighborMetadata != NULL)
++		memcpy(sc->neighborMetadata, neighborMetadata, HNSW_NEIGHBOR_METADATA_BYTES);
++	else
++		memset(sc->neighborMetadata, 0, HNSW_NEIGHBOR_METADATA_BYTES);
++
++	return sc;
++}
++
++static HnswSearchCandidate *
++InitSearchCandidateWithEmptyElement(HnswNeighborEntry ne, bool residualCompressionEnabled)
++{
++	HnswSearchCandidate *sc = palloc(sizeof(HnswSearchCandidate));
++
++	memset(&sc->element, 0, sizeof(HnswElementPtr));
++	sc->indextid = ne->indextid;
++	sc->distance = ne->distance;
++
++	if (residualCompressionEnabled)
++		memcpy(sc->neighborMetadata, ne->metadata, HNSW_NEIGHBOR_METADATA_BYTES);
++
+ 	return sc;
+ }
+ 
+@@ -598,7 +752,7 @@ HnswInitSearchCandidate(char *base, HnswElement element, double distance)
+  * Create a candidate for the entry point
+  */
+ HnswSearchCandidate *
+-HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec)
++HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, void * pqstate, char *neighborMetadata)
+ {
+ 	bool		inMemory = index == NULL;
+ 	double		distance;
+@@ -606,9 +760,9 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
+ 	if (inMemory)
+ 		distance = GetElementDistance(base, entryPoint, q, support);
+ 	else
+-		HnswLoadElement(entryPoint, &distance, q, index, support, loadVec, NULL);
++		HnswLoadElement(entryPoint, &distance, q, index, support, loadVec, NULL, pqstate, neighborMetadata);
+ 
+-	return HnswInitSearchCandidate(base, entryPoint, distance);
++	return HnswInitSearchCandidate(base, entryPoint, distance, neighborMetadata);
+ }
+ 
+ /*
+@@ -748,11 +902,13 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
+  * Load neighbor index TIDs
+  */
+ bool
+-HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
++HnswLoadNeighborEntries(HnswElement element, HnswNeighborEntryData *entries, Relation index, int m, int lm, int lc, bool hasNeighborMetadata)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+ 	HnswNeighborTuple ntup;
++	char		eBuf[HNSW_MAX_M * 2 * HNSW_NEIGHBOR_TUPLE_ENTRY_MAX_SIZE];
++	int			entrySize = HNSW_NEIGHBOR_TUPLE_ENTRY_SIZE(hasNeighborMetadata);
+ 	int			start;
+ 
+ 	buf = ReadBuffer(index, element->neighborPage);
+@@ -773,37 +929,158 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
+ 
+ 	/* Copy to minimize lock time */
+ 	start = (element->level - lc) * m;
+-	memcpy(indextids, ntup->indextids + start, lm * sizeof(ItemPointerData));
++	memcpy(eBuf, ntup->entries + (start * entrySize), lm * entrySize);
+ 
+ 	UnlockReleaseBuffer(buf);
++
++	for (int i = 0; i < lm; i++)
++	{
++		HnswNeighborEntry ne = &entries[i];
++		int offset = i * entrySize;
++
++		memcpy(&ne->indextid, eBuf + offset, sizeof(ItemPointerData));
++
++		if (!ItemPointerIsValid(&ne->indextid))
++			break;
++
++		if (hasNeighborMetadata)
++			memcpy(&ne->metadata, eBuf + offset + sizeof(ItemPointerData), HNSW_NEIGHBOR_METADATA_BYTES);
++	}
++
+ 	return true;
+ }
+ 
++static int
++CompareNearestNeighborEntries(const void *a, const void *b)
++{
++	HnswNeighborEntryData *entryA = (HnswNeighborEntryData *) a;
++	HnswNeighborEntryData *entryB = (HnswNeighborEntryData *) b;
++
++	if (entryA->distance < entryB->distance)
++		return -1;
++	else if (entryA->distance > entryB->distance)
++		return 1;
++	else
++		return 0;
++}
++
++static void
++EstimateAndSortDistancesFromMetadata(char *base, HnswElement element, HnswQuery * q, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, void * pqstate, HnswNeighborEntryData *entries, int *unvisitedIndexes, int *unvisitedLength)
++{
++	int maxNeighborEntries;
++
++	if (*unvisitedLength == 0)
++		return;
++
++	maxNeighborEntries = unvisitedIndexes[(*unvisitedLength) - 1] + 1;
++
++	/*
++	 * Initialize with DBL_MAX so that unused entries are placed
++	 * at the end of the array after sorting
++	 */
++	for (int i = 0; i < maxNeighborEntries; i++)
++		entries[i].distance = DBL_MAX;
++
++	/* Estimate distances from neighbor metadata */
++	typeInfo->estimateDistances(q->value, entries, unvisitedIndexes, *unvisitedLength, pqstate, support);
++
++	/* Sort distances in ascending order for processing prioritization */
++	qsort(entries, maxNeighborEntries, sizeof(HnswNeighborEntryData), CompareNearestNeighborEntries);
++}
++
+ /*
+  * Load unvisited neighbors from disk
++ * If useNeighborMetadata is true, compute estimated distances from the neighbor metadata to avoid unencessary block reads
+  */
+ static void
+-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
++HnswLoadUnvisitedFromDisk(char *base, HnswElement element, HnswQuery * q, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, int lm, int lc, bool hasNeighborMetadata, bool useNeighborMetadata, int topk, pairingheap * E, void * pqstate)
+ {
+-	ItemPointerData indextids[HNSW_MAX_M * 2];
++	HnswNeighborEntryData entries[HNSW_MAX_M * 2];
++	int unvisitedIndexes[HNSW_MAX_M * 2];
+ 
+ 	*unvisitedLength = 0;
+ 
+-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
++	if (!HnswLoadNeighborEntries(element, entries, index, m, lm, lc, hasNeighborMetadata))
+ 		return;
+ 
+ 	for (int i = 0; i < lm; i++)
+ 	{
+-		ItemPointer indextid = &indextids[i];
++		ItemPointer indextid = &entries[i].indextid;
+ 		bool		found;
+ 
+ 		if (!ItemPointerIsValid(indextid))
+ 			break;
+ 
+-		tidhash_insert(v->tids, *indextid, &found);
++		if (useNeighborMetadata)
++		{
++			if (tidhash_lookup(v->tids, *indextid) == NULL)
++				unvisitedIndexes[(*unvisitedLength)++] = i;
++		}
++		else
++		{
++			tidhash_insert(v->tids, *indextid, &found);
+ 
+-		if (!found)
+-			unvisited[(*unvisitedLength)++].indextid = *indextid;
++			if (!found)
++				unvisited[(*unvisitedLength)++].entry = entries[i];
++		}
++	}
++
++	/* Compute estimated distances from the neighbor metadata */
++	if (useNeighborMetadata)
++	{
++		EstimateAndSortDistancesFromMetadata(base, element, q, index, typeInfo, support, pqstate, entries, unvisitedIndexes, unvisitedLength);
++
++		for (int i = 0; i < *unvisitedLength; i++)
++		{
++			if (i < topk)
++			{
++				ItemPointer indextid = &entries[i].indextid;
++				bool		found;
++
++				tidhash_insert(v->tids, *indextid, &found);
++
++				Assert(!found);
++
++				unvisited[i].entry = entries[i];
++			}
++			else
++			{
++				/*
++				 * Add to the estimated distance queue E for rechecking entries in the end of search
++				 * Due to the variance in estimated distances caused by SimHash, an element's estimated distance
++				 * varies depending on which neighbor node it's estimated from, so we don't exclude
++				 * by tid and insert into the heap
++				 */
++				HnswSearchCandidate *sc = InitSearchCandidateWithEmptyElement(&entries[i], HNSW_PQ_RESIDUAL_COMPRESSION_ENABLED(pqstate));
++				pairingheap_add(E, &sc->c_node);
++			}
++		}
++
++		/* Return only the topk nearest neighbor elements that are search candidates */
++		*unvisitedLength = *unvisitedLength < topk ? *unvisitedLength : topk;
++	}
++}
++
++static void
++RemoveFurthestCandidate(char *base, HnswElement eElement, int *wlen, int ef, HnswElement skipElement, pairingheap * W, pairingheap **discarded)
++{
++	/*
++	 * Do not count elements being deleted towards ef when vacuuming.
++	 * It would be ideal to do this for inserts as well, but this
++	 * could affect insert performance.
++	 */
++	if (CountElement(skipElement, eElement))
++	{
++		(*wlen)++;
++
++		/* No need to decrement wlen */
++		if (*wlen > ef)
++		{
++			HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
++
++			if (discarded != NULL)
++				pairingheap_add(*discarded, &d->w_node);
++		}
+ 	}
+ }
+ 
+@@ -811,11 +1088,12 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
+  * Algorithm 2 from paper
+  */
+ List *
+-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
++HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, void * pqstate, bool candidatePruning)
+ {
+ 	List	   *w = NIL;
+ 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
+ 	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
++	pairingheap *E = NULL;
+ 	int			wlen = 0;
+ 	visited_hash vh;
+ 	ListCell   *lc2;
+@@ -825,6 +1103,12 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
+ 	int			unvisitedLength;
+ 	bool		inMemory = index == NULL;
++	bool		residualCompressionEnabled = HNSW_PQ_RESIDUAL_COMPRESSION_ENABLED(pqstate);
++	bool		hasNeighborMetadata = HNSW_PQ_NEIGHBOR_METADATA_EXISTS(pqstate);
++	bool		queryIsNull = DatumGetPointer(q->value) == NULL;
++	bool		useNeighborMetadata = hnsw_candidate_pruning && candidatePruning && hasNeighborMetadata && !queryIsNull;
++	bool		monotonic = true;
++	double		prevDistance = DBL_MAX;
+ 
+ 	if (v == NULL)
+ 	{
+@@ -847,6 +1131,9 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 		localNeighborhood = palloc(neighborhoodSize);
+ 	}
+ 
++	if (useNeighborMetadata)
++		E = pairingheap_allocate(CompareNearestCandidates, NULL);
++
+ 	/* Add entry points to v, C, and W */
+ 	foreach(lc2, ep)
+ 	{
+@@ -883,12 +1170,26 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 		if (c->distance > f->distance)
+ 			break;
+ 
++		/*
++		 * When monotonically approaching query q, do best-first search based on estimated distances
++		 * instead of indiscriminately reading blocks.
++		 */
++		if (monotonic)
++		{
++			monotonic = c->distance <= prevDistance;
++			prevDistance = c->distance;
++		}
++
+ 		cElement = HnswPtrAccess(base, c->element);
+ 
++		/* Load vector to estimate distance from metadata */
++		if (useNeighborMetadata && !HnswVectorIsLoaded(base, cElement))
++			LoadVectorInElement(index, cElement, pqstate, c->neighborMetadata);
++
+ 		if (inMemory)
+ 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
+ 		else
+-			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
++			HnswLoadUnvisitedFromDisk(base, cElement, q, unvisited, &unvisitedLength, v, index, typeInfo, support, m, lm, lc, hasNeighborMetadata, useNeighborMetadata, monotonic && lc == 0 ? 1 : hnsw_distance_computation_topk, E, pqstate);
+ 
+ 		/* OK to count elements instead of tuples */
+ 		if (tuples != NULL)
+@@ -910,13 +1211,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 			}
+ 			else
+ 			{
+-				ItemPointer indextid = &unvisited[i].indextid;
++				HnswNeighborEntry ne = &unvisited[i].entry;
++				ItemPointer indextid = &ne->indextid;
+ 				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
+ 				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
++				char 	   *neighborMetadata = ne->metadata;
+ 
+ 				/* Avoid any allocations if not adding */
+ 				eElement = NULL;
+-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
++				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement, pqstate, neighborMetadata);
+ 
+ 				if (eElement == NULL)
+ 					continue;
+@@ -927,7 +1230,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 				if (discarded != NULL)
+ 				{
+ 					/* Create a new candidate */
+-					e = HnswInitSearchCandidate(base, eElement, eDistance);
++					e = HnswInitSearchCandidate(base, eElement, eDistance, (inMemory || !residualCompressionEnabled) ? NULL : unvisited[i].entry.metadata);
+ 					pairingheap_add(*discarded, &e->w_node);
+ 				}
+ 
+@@ -939,27 +1242,65 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 				continue;
+ 
+ 			/* Create a new candidate */
+-			e = HnswInitSearchCandidate(base, eElement, eDistance);
++			e = HnswInitSearchCandidate(base, eElement, eDistance, (inMemory || !residualCompressionEnabled) ? NULL : unvisited[i].entry.metadata);
+ 			pairingheap_add(C, &e->c_node);
+ 			pairingheap_add(W, &e->w_node);
+ 
+-			/*
+-			 * Do not count elements being deleted towards ef when vacuuming.
+-			 * It would be ideal to do this for inserts as well, but this
+-			 * could affect insert performance.
+-			 */
+-			if (CountElement(skipElement, eElement))
+-			{
+-				wlen++;
++			RemoveFurthestCandidate(base, eElement, &wlen, ef, skipElement, W, discarded);
++		}
++	}
+ 
+-				/* No need to decrement wlen */
+-				if (wlen > ef)
+-				{
+-					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
++#if defined(HNSW_SCAN_ESTIMATED_DISTANCE_QUEUE)
++	/*
++	 * Finally, add the elements in E to W. Since E is sorted in order of distance proximity,
++	 * adding elements from E to W in the order they are retrieved will keep W sorted
++	 * by distance proximity as well.
++	 */
++	while (useNeighborMetadata && !pairingheap_is_empty(E))
++	{
++		HnswSearchCandidate *e = HnswGetSearchCandidate(c_node, pairingheap_remove_first(E));
++		HnswSearchCandidate *w = HnswGetSearchCandidate(w_node, pairingheap_first(W));
++		bool		found;
+ 
+-					if (discarded != NULL)
+-						pairingheap_add(*discarded, &d->w_node);
+-				}
++		if (e->distance > w->distance)
++		{
++			/* Put back for iterative scans */
++			pairingheap_add(E, &e->c_node);
++			break;
++		}
++
++		tidhash_insert(v->tids, e->indextid, &found);
++
++		if (!found)
++		{
++			LoadElementInSearchCandidate(base, e, q, index, support, false, pqstate);
++			pairingheap_add(W, &e->w_node);
++
++			RemoveFurthestCandidate(base, HnswPtrAccess(base, e->element), &wlen, ef, skipElement, W, discarded);
++		}
++	}
++#endif
++
++	/* Pruned elements are needed for iterative scans */
++	if (useNeighborMetadata && discarded != NULL)
++	{
++		while (!pairingheap_is_empty(E))
++		{
++			HnswSearchCandidate *e = HnswGetSearchCandidate(c_node, pairingheap_remove_first(E));
++			bool		found;
++
++			tidhash_insert(v->tids, e->indextid, &found);
++
++			if (!found)
++			{
++				/*
++				 * TODO Essentially, it seems unnecessary to load Element here, but it's unclear whether
++				 * there would be any issues if we assume that the estimated distances
++				 * have reasonably high accuracy
++				 */
++				LoadElementInSearchCandidate(base, e, q, index, support, false, pqstate);
++
++				pairingheap_add(*discarded, &e->w_node);
+ 			}
+ 		}
+ 	}
+@@ -1267,7 +1608,7 @@ PrecomputeHash(char *base, HnswElement element)
+  * Algorithm 1 from paper
+  */
+ void
+-HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing)
++HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, int efConstruction, bool existing, void * pqstate, char *entryMetadata)
+ {
+ 	List	   *ep;
+ 	List	   *w;
+@@ -1275,6 +1616,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+ 	int			entryLevel;
+ 	HnswQuery	q;
+ 	HnswElement skipElement = existing ? element : NULL;
++	bool		residualCompressionEnabled = HNSW_PQ_RESIDUAL_COMPRESSION_ENABLED(pqstate);
+ 	bool		inMemory = index == NULL;
+ 
+ 	q.value = HnswGetValue(base, element);
+@@ -1288,13 +1630,13 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+ 		return;
+ 
+ 	/* Get entry point and level */
+-	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true));
++	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true, pqstate, residualCompressionEnabled ? entryMetadata : NULL));
+ 	entryLevel = entryPoint->level;
+ 
+ 	/* 1st phase: greedy search to insert level */
+ 	for (int lc = entryLevel; lc >= level + 1; lc--)
+ 	{
+-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
++		w = HnswSearchLayer(base, &q, ep, 1, lc, index, typeInfo, support, m, true, skipElement, NULL, NULL, true, NULL, pqstate, false);
+ 		ep = w;
+ 	}
+ 
+@@ -1313,7 +1655,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+ 		List	   *lw = NIL;
+ 		ListCell   *lc2;
+ 
+-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
++		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, typeInfo, support, m, true, skipElement, NULL, NULL, true, NULL, pqstate, false);
+ 
+ 		/* Convert search candidates to candidates */
+ 		foreach(lc2, w)
+@@ -1324,6 +1666,9 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+ 			hc->element = sc->element;
+ 			hc->distance = sc->distance;
+ 
++			if (!inMemory && residualCompressionEnabled)
++				memcpy(hc->neighborMetadata, sc->neighborMetadata, HNSW_NEIGHBOR_METADATA_BYTES);
++
+ 			lw = lappend(lw, hc);
+ 		}
+ 
+@@ -1370,13 +1715,44 @@ HnswGetTypeInfo(Relation index)
+ 
+ 	if (procinfo == NULL)
+ 	{
+-		static const HnswTypeInfo typeInfo = {
+-			.maxDimensions = HNSW_MAX_DIM,
+-			.normalize = l2_normalize,
+-			.checkValue = NULL
+-		};
++		FmgrInfo	*distance_procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
+ 
+-		return (&typeInfo);
++		/*
++		 * In case of the L2 distance on single-precision (float) vectors (vector_l2_ops),
++		 * enables the simhash computation and distance estimation.
++		 */
++		if (HnswIsVectorL2Distance(distance_procinfo))
++		{
++			static const HnswTypeInfo typeInfo = {
++				.maxDimensions = HNSW_MAX_DIM,
++				.normalize = l2_normalize,
++				.checkValue = NULL,
++				.pqEnabled = true,
++				.itemSize = HnswVectorItemSize,
++				.updateCenter = HnswVectorUpdateCenter,
++				.sumCenter = HnswVectorSumCenter,
++				.setNeighborMetadata = HnswSetVectorL2NeighborMetadata,
++				.estimateDistances = HnswEstimateVectorL2Distances
++			};
++
++			return (&typeInfo);
++		}
++		else
++		{
++			static const HnswTypeInfo typeInfo = {
++				.maxDimensions = HNSW_MAX_DIM,
++				.normalize = l2_normalize,
++				.checkValue = NULL,
++				.pqEnabled = false,
++				.itemSize = NULL,
++				.updateCenter = NULL,
++				.sumCenter = NULL,
++				.setNeighborMetadata = NULL,
++				.estimateDistances = NULL
++			};
++
++			return (&typeInfo);
++		}
+ 	}
+ 	else
+ 		return (const HnswTypeInfo *) DatumGetPointer(FunctionCall0Coll(procinfo, InvalidOid));
+@@ -1389,7 +1765,13 @@ hnsw_halfvec_support(PG_FUNCTION_ARGS)
+ 	static const HnswTypeInfo typeInfo = {
+ 		.maxDimensions = HNSW_MAX_DIM * 2,
+ 		.normalize = halfvec_l2_normalize,
+-		.checkValue = NULL
++		.checkValue = NULL,
++		.pqEnabled = false,
++		.itemSize = NULL,
++		.updateCenter = NULL,
++		.sumCenter = NULL,
++		.setNeighborMetadata = NULL,
++		.estimateDistances = NULL
+ 	};
+ 
+ 	PG_RETURN_POINTER(&typeInfo);
+@@ -1402,7 +1784,13 @@ hnsw_bit_support(PG_FUNCTION_ARGS)
+ 	static const HnswTypeInfo typeInfo = {
+ 		.maxDimensions = HNSW_MAX_DIM * 32,
+ 		.normalize = NULL,
+-		.checkValue = NULL
++		.checkValue = NULL,
++		.pqEnabled = false,
++		.itemSize = NULL,
++		.updateCenter = NULL,
++		.sumCenter = NULL,
++		.setNeighborMetadata = NULL,
++		.estimateDistances = NULL
+ 	};
+ 
+ 	PG_RETURN_POINTER(&typeInfo);
+@@ -1415,7 +1803,13 @@ hnsw_sparsevec_support(PG_FUNCTION_ARGS)
+ 	static const HnswTypeInfo typeInfo = {
+ 		.maxDimensions = SPARSEVEC_MAX_DIM,
+ 		.normalize = sparsevec_l2_normalize,
+-		.checkValue = SparsevecCheckValue
++		.checkValue = SparsevecCheckValue,
++		.pqEnabled = false,
++		.itemSize = NULL,
++		.updateCenter = NULL,
++		.sumCenter = NULL,
++		.setNeighborMetadata = NULL,
++		.estimateDistances = NULL
+ 	};
+ 
+ 	PG_RETURN_POINTER(&typeInfo);
+diff --git a/src/hnswvacuum.c b/src/hnswvacuum.c
+index 251d9d9..e8f7c37 100644
+--- a/src/hnswvacuum.c
++++ b/src/hnswvacuum.c
+@@ -3,11 +3,15 @@
+ #include <math.h>
+ 
+ #include "access/generic_xlog.h"
++#include "access/table.h"
+ #include "commands/vacuum.h"
+ #include "hnsw.h"
++#include "hnswpq.h"
+ #include "storage/bufmgr.h"
+ #include "storage/lmgr.h"
++#include "utils/datum.h"
+ #include "utils/memutils.h"
++#include "vector.h"
+ 
+ /*
+  * Check if deleted list contains an index TID
+@@ -26,11 +30,11 @@ DeletedContains(tidhash_hash * deleted, ItemPointer indextid)
+ static void
+ RemoveHeapTids(HnswVacuumState * vacuumstate)
+ {
+-	BlockNumber blkno = HNSW_HEAD_BLKNO;
++	BlockNumber blkno = HnswGetHeadBlockNumber(vacuumstate->index);
+ 	HnswElement highestPoint = &vacuumstate->highestPoint;
+ 	Relation	index = vacuumstate->index;
+ 	BufferAccessStrategy bas = vacuumstate->bas;
+-	HnswElement entryPoint = HnswGetEntryPoint(vacuumstate->index);
++	HnswElement entryPoint = HnswGetEntryPoint(vacuumstate->index, NULL);
+ 	IndexBulkDeleteResult *stats = vacuumstate->stats;
+ 
+ 	/* Store separately since highestPoint.level is uint8 */
+@@ -138,6 +142,7 @@ static bool
+ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
+ {
+ 	Relation	index = vacuumstate->index;
++	bool		hasNeighborMetadata = HnswSupportNeighborMetadata(index);
+ 	BufferAccessStrategy bas = vacuumstate->bas;
+ 	Buffer		buf;
+ 	Page		page;
+@@ -154,7 +159,7 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
+ 	/* Check neighbors */
+ 	for (int i = 0; i < ntup->count; i++)
+ 	{
+-		ItemPointer indextid = &ntup->indextids[i];
++		ItemPointer indextid = HnswNeighborEntryItemPointerAccess(ntup->entries, i, hasNeighborMetadata);
+ 
+ 		if (!ItemPointerIsValid(indextid))
+ 			continue;
+@@ -170,7 +175,10 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
+ 	/* Also update if layer 0 is not full */
+ 	/* This could indicate too many candidates being deleted during insert */
+ 	if (!needsUpdated)
+-		needsUpdated = !ItemPointerIsValid(&ntup->indextids[ntup->count - 1]);
++	{
++		ItemPointer indextid = HnswNeighborEntryItemPointerAccess(ntup->entries, ntup->count - 1, hasNeighborMetadata);
++		needsUpdated = !ItemPointerIsValid(indextid);
++	}
+ 
+ 	UnlockReleaseBuffer(buf);
+ 
+@@ -181,9 +189,10 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
+  * Repair graph for a single element
+  */
+ static void
+-RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswElement entryPoint)
++RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswElement entryPoint, char *entryMetadata)
+ {
+ 	Relation	index = vacuumstate->index;
++	const		HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
+ 	HnswSupport *support = &vacuumstate->support;
+ 	Buffer		buf;
+ 	Page		page;
+@@ -192,26 +201,35 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
+ 	int			efConstruction = vacuumstate->efConstruction;
+ 	BufferAccessStrategy bas = vacuumstate->bas;
+ 	HnswNeighborTuple ntup = vacuumstate->ntup;
+-	Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
++	Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m, HNSW_PQ_NEIGHBOR_METADATA_EXISTS(vacuumstate->pqState));
+ 	char	   *base = NULL;
+ 
+ 	/* Skip if element is entry point */
+ 	if (entryPoint != NULL && element->blkno == entryPoint->blkno && element->offno == entryPoint->offno)
+ 		return;
+ 
++	/* If element compression enabled, load original vector from heap */
++	if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(vacuumstate->pqState))
++	{
++		Datum hv = LoadVectorFromHeap(element, vacuumstate->heap, index, support);
++		Datum value = datumCopy(hv, false, -1);
++		HnswPtrStore(base, element->value, DatumGetPointer(value));
++		pfree(DatumGetPointer(hv));
++	}
++
+ 	/* Init fields */
+ 	HnswInitNeighbors(base, element, m, NULL);
+ 	element->heaptidsLength = 0;
+ 
+ 	/* Find neighbors for element, skipping itself */
+-	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, true);
++	HnswFindElementNeighbors(base, element, entryPoint, index, typeInfo, support, m, efConstruction, true, vacuumstate->pqState, entryMetadata);
+ 
+ 	/* Zero memory for each element */
+ 	MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
+ 
+ 	/* Update neighbor tuple */
+ 	/* Do this before getting page to minimize locking */
+-	HnswSetNeighborTuple(base, ntup, element, m);
++	HnswSetNeighborTuple(base, ntup, element, m, typeInfo, support, vacuumstate->pqState);
+ 
+ 	/* Get neighbor page */
+ 	buf = ReadBufferExtended(index, MAIN_FORKNUM, element->neighborPage, RBM_NORMAL, bas);
+@@ -228,7 +246,7 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
+ 	UnlockReleaseBuffer(buf);
+ 
+ 	/* Update neighbors */
+-	HnswUpdateNeighborsOnDisk(index, support, element, m, true, false);
++	HnswUpdateNeighborsOnDisk(index, typeInfo, support, element, m, true, false, vacuumstate->pqState);
+ }
+ 
+ /*
+@@ -238,9 +256,11 @@ static void
+ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+ {
+ 	Relation	index = vacuumstate->index;
++	const		HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
+ 	HnswSupport *support = &vacuumstate->support;
+ 	HnswElement highestPoint = &vacuumstate->highestPoint;
+ 	HnswElement entryPoint;
++	char		entryMetadata[HNSW_NEIGHBOR_METADATA_BYTES];
+ 	MemoryContext oldCtx = MemoryContextSwitchTo(vacuumstate->tmpCtx);
+ 
+ 	if (!BlockNumberIsValid(highestPoint->blkno))
+@@ -256,11 +276,14 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+ 		LockPage(index, HNSW_UPDATE_LOCK, ShareLock);
+ 
+ 		/* Load element */
+-		HnswLoadElement(highestPoint, NULL, NULL, index, support, true, NULL);
++		HnswLoadElement(highestPoint, NULL, NULL, index, support, false, NULL, vacuumstate->pqState, NULL);
+ 
+ 		/* Repair if needed */
+ 		if (NeedsUpdated(vacuumstate, highestPoint))
+-			RepairGraphElement(vacuumstate, highestPoint, HnswGetEntryPoint(index));
++		{
++			entryPoint = HnswGetEntryPoint(index, entryMetadata);
++			RepairGraphElement(vacuumstate, highestPoint, entryPoint, entryMetadata);
++		}
+ 
+ 		/* Release lock */
+ 		UnlockPage(index, HNSW_UPDATE_LOCK, ShareLock);
+@@ -270,7 +293,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+ 	LockPage(index, HNSW_UPDATE_LOCK, ExclusiveLock);
+ 
+ 	/* Get latest entry point */
+-	entryPoint = HnswGetEntryPoint(index);
++	entryPoint = HnswGetEntryPoint(index, entryMetadata);
+ 
+ 	if (entryPoint != NULL)
+ 	{
+@@ -285,7 +308,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+ 			 * point is outdated and empty, the entry point will be empty
+ 			 * until an element is repaired.
+ 			 */
+-			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, MAIN_FORKNUM, false);
++			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, typeInfo, support, NULL, highestPoint, InvalidBlockNumber, MAIN_FORKNUM, false, vacuumstate->pqState);
+ 		}
+ 		else
+ 		{
+@@ -294,7 +317,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+ 			 * is outdated, this can remove connections at higher levels in
+ 			 * the graph until they are repaired, but this should be fine.
+ 			 */
+-			HnswLoadElement(entryPoint, NULL, NULL, index, support, true, NULL);
++			HnswLoadElement(entryPoint, NULL, NULL, index, support, true, NULL, vacuumstate->pqState, entryMetadata);
+ 
+ 			if (NeedsUpdated(vacuumstate, entryPoint))
+ 			{
+@@ -302,7 +325,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+ 				if (highestPoint != NULL)
+ 					HnswPtrStore((char *) NULL, highestPoint->neighbors, (HnswNeighborArrayPtr *) NULL);
+ 
+-				RepairGraphElement(vacuumstate, entryPoint, highestPoint);
++				RepairGraphElement(vacuumstate, entryPoint, highestPoint, entryMetadata);
+ 			}
+ 		}
+ 	}
+@@ -321,9 +344,10 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+ static void
+ RepairGraph(HnswVacuumState * vacuumstate)
+ {
++	const		HnswTypeInfo *typeInfo = HnswGetTypeInfo(vacuumstate->index);
+ 	Relation	index = vacuumstate->index;
+ 	BufferAccessStrategy bas = vacuumstate->bas;
+-	BlockNumber blkno = HNSW_HEAD_BLKNO;
++	BlockNumber blkno = HnswGetHeadBlockNumber(index);
+ 
+ 	/*
+ 	 * Wait for inserts to complete. Inserts before this point may have
+@@ -370,7 +394,26 @@ RepairGraph(HnswVacuumState * vacuumstate)
+ 
+ 			/* Create an element */
+ 			element = HnswInitElementFromBlock(blkno, offno);
+-			HnswLoadElementFromTuple(element, etup, false, true);
++
++			if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(vacuumstate->pqState))
++			{
++				Datum	hv;
++				Datum	value;
++				char   *base = NULL;
++
++				/* Load element info without loading vector from element tuple */
++				HnswLoadElementFromTuple(element, etup, false, false, vacuumstate->index, &vacuumstate->support, NULL, NULL);
++
++				/* Then, load original vector from heap for lossy PQ representation */
++				hv = LoadVectorFromHeap(element, vacuumstate->heap, index, &vacuumstate->support);
++				value = datumCopy(hv, false, -1);
++				HnswPtrStore(base, element->value, DatumGetPointer(value));
++			}
++			else
++			{
++				/* No compression case */
++				HnswLoadElementFromTuple(element, etup, false, true, vacuumstate->index, &vacuumstate->support, NULL, NULL);
++			}
+ 
+ 			elements = lappend(elements, element);
+ 		}
+@@ -384,6 +427,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
+ 		{
+ 			HnswElement element = (HnswElement) lfirst(lc2);
+ 			HnswElement entryPoint;
++			char		entryMetadata[HNSW_NEIGHBOR_METADATA_BYTES];
+ 			LOCKMODE	lockmode = ShareLock;
+ 
+ 			/* Check if any neighbors point to deleted values */
+@@ -394,7 +438,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
+ 			LockPage(index, HNSW_UPDATE_LOCK, lockmode);
+ 
+ 			/* Refresh entry point for each element */
+-			entryPoint = HnswGetEntryPoint(index);
++			entryPoint = HnswGetEntryPoint(index, entryMetadata);
+ 
+ 			/* Prevent concurrent inserts when likely updating entry point */
+ 			if (entryPoint == NULL || element->level > entryPoint->level)
+@@ -407,18 +451,18 @@ RepairGraph(HnswVacuumState * vacuumstate)
+ 				LockPage(index, HNSW_UPDATE_LOCK, lockmode);
+ 
+ 				/* Get latest entry point after lock is acquired */
+-				entryPoint = HnswGetEntryPoint(index);
++				entryPoint = HnswGetEntryPoint(index, entryMetadata);
+ 			}
+ 
+ 			/* Repair connections */
+-			RepairGraphElement(vacuumstate, element, entryPoint);
++			RepairGraphElement(vacuumstate, element, entryPoint, entryMetadata);
+ 
+ 			/*
+ 			 * Update metapage if needed. Should only happen if entry point
+ 			 * was replaced and highest point was outdated.
+ 			 */
+ 			if (entryPoint == NULL || element->level > entryPoint->level)
+-				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, false);
++				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, typeInfo, &vacuumstate->support, NULL, entryPoint, InvalidBlockNumber, MAIN_FORKNUM, false, vacuumstate->pqState);
+ 
+ 			/* Release lock */
+ 			UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
+@@ -436,9 +480,11 @@ RepairGraph(HnswVacuumState * vacuumstate)
+ static void
+ MarkDeleted(HnswVacuumState * vacuumstate)
+ {
+-	BlockNumber blkno = HNSW_HEAD_BLKNO;
++	BlockNumber blkno = HnswGetHeadBlockNumber(vacuumstate->index);
+ 	BlockNumber insertPage = InvalidBlockNumber;
+ 	Relation	index = vacuumstate->index;
++	bool		hasNeighborMetadata = HnswSupportNeighborMetadata(index);
++	const		HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
+ 	BufferAccessStrategy bas = vacuumstate->bas;
+ 
+ 	/*
+@@ -525,7 +571,10 @@ MarkDeleted(HnswVacuumState * vacuumstate)
+ 
+ 			/* Overwrite neighbors */
+ 			for (int i = 0; i < ntup->count; i++)
+-				ItemPointerSetInvalid(&ntup->indextids[i]);
++			{
++				ItemPointer indextid = HnswNeighborEntryItemPointerAccess(ntup->entries, i, hasNeighborMetadata);
++				ItemPointerSetInvalid(indextid);
++			}
+ 
+ 			/* Increment version */
+ 			/* This is used to avoid incorrect reads for iterative scans */
+@@ -561,7 +610,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
+ 	}
+ 
+ 	/* Update insert page last, after everything has been marked as deleted */
+-	HnswUpdateMetaPage(index, 0, NULL, insertPage, MAIN_FORKNUM, false);
++	HnswUpdateMetaPage(index, 0, typeInfo, &vacuumstate->support, NULL, NULL, insertPage, MAIN_FORKNUM, false, vacuumstate->pqState);
+ }
+ 
+ /*
+@@ -589,7 +638,16 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
+ 	HnswInitSupport(&vacuumstate->support, index);
+ 
+ 	/* Get m from metapage */
+-	HnswGetMetaPageInfo(index, &vacuumstate->m, NULL);
++	HnswGetMetaPageInfo(index, &vacuumstate->m, NULL, NULL);
++
++	/* Load PQ state */
++	vacuumstate->pqState = HnswLoadPQStateFromDisk(index);
++
++	/* Load vectors from heap if elements are compressed */
++	if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(vacuumstate->pqState))
++		vacuumstate->heap = table_open(index->rd_index->indrelid, AccessShareLock);
++	else
++		vacuumstate->heap = NULL;
+ 
+ 	/* Create hash table */
+ 	vacuumstate->deleted = tidhash_create(CurrentMemoryContext, 256, NULL);
+@@ -605,6 +663,10 @@ FreeVacuumState(HnswVacuumState * vacuumstate)
+ 	FreeAccessStrategy(vacuumstate->bas);
+ 	pfree(vacuumstate->ntup);
+ 	MemoryContextDelete(vacuumstate->tmpCtx);
++
++	/* Close heap relation */
++	if (vacuumstate->heap)
++		table_close(vacuumstate->heap, AccessShareLock);
+ }
+ 
+ /*
+diff --git a/src/ivfbuild.c b/src/ivfbuild.c
+index 54a5be5..2bd9223 100644
+--- a/src/ivfbuild.c
++++ b/src/ivfbuild.c
+@@ -403,7 +403,12 @@ FreeBuildState(IvfflatBuildState * buildstate)
+ static void
+ ComputeCenters(IvfflatBuildState * buildstate)
+ {
+-	int			numSamples;
++	int 				numSamples;
++	const KmeansInfo 	kmeansInfo = {
++		.procinfo = index_getprocinfo(buildstate->index, 1, IVFFLAT_KMEANS_DISTANCE_PROC),
++		.normprocinfo = IvfflatOptionalProcInfo(buildstate->index, IVFFLAT_KMEANS_NORM_PROC),
++		.collation = buildstate->index->rd_indcollation[0]
++	};
+ 
+ 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_IVFFLAT_PHASE_KMEANS);
+ 
+@@ -434,7 +439,7 @@ ComputeCenters(IvfflatBuildState * buildstate)
+ 	}
+ 
+ 	/* Calculate centers */
+-	IvfflatBench("k-means", IvfflatKmeans(buildstate->index, buildstate->samples, buildstate->centers, buildstate->typeInfo));
++	IvfflatBench("k-means", IvfflatKmeans(buildstate->index, buildstate->samples, buildstate->centers, buildstate->typeInfo, &kmeansInfo));
+ 
+ 	/* Free samples before we allocate more memory */
+ 	VectorArrayFree(buildstate->samples);
+diff --git a/src/ivfflat.h b/src/ivfflat.h
+index c296b66..a73bf5f 100644
+--- a/src/ivfflat.h
++++ b/src/ivfflat.h
+@@ -166,6 +166,13 @@ typedef struct IvfflatTypeInfo
+ 	void		(*sumCenter) (Pointer v, float *x);
+ }			IvfflatTypeInfo;
+ 
++typedef struct KmeansInfo
++{
++	FmgrInfo   *procinfo;
++	FmgrInfo   *normprocinfo;
++	Oid			collation;
++} 			KmeansInfo;
++
+ typedef struct IvfflatBuildState
+ {
+ 	/* Info */
+@@ -303,7 +310,7 @@ VectorArraySet(VectorArray arr, int offset, Pointer val)
+ /* Methods */
+ VectorArray VectorArrayInit(int maxlen, int dimensions, Size itemsize);
+ void		VectorArrayFree(VectorArray arr);
+-void		IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo);
++void		IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo, const KmeansInfo * kmeansInfo);
+ FmgrInfo   *IvfflatOptionalProcInfo(Relation index, uint16 procnum);
+ Datum		IvfflatNormValue(const IvfflatTypeInfo * typeInfo, Oid collation, Datum value);
+ bool		IvfflatCheckNorm(FmgrInfo *procinfo, Oid collation, Datum value);
+diff --git a/src/ivfkmeans.c b/src/ivfkmeans.c
+index 4b6d14f..60a4016 100644
+--- a/src/ivfkmeans.c
++++ b/src/ivfkmeans.c
+@@ -19,7 +19,7 @@
+  * https://theory.stanford.edu/~sergei/papers/kMeansPP-soda.pdf
+  */
+ static void
+-InitCenters(Relation index, VectorArray samples, VectorArray centers, float *lowerBound)
++InitCenters(Relation index, VectorArray samples, VectorArray centers, float *lowerBound, const KmeansInfo * kmeansInfo)
+ {
+ 	FmgrInfo   *procinfo;
+ 	Oid			collation;
+@@ -28,8 +28,8 @@ InitCenters(Relation index, VectorArray samples, VectorArray centers, float *low
+ 	int			numCenters = centers->maxlen;
+ 	int			numSamples = samples->length;
+ 
+-	procinfo = index_getprocinfo(index, 1, IVFFLAT_KMEANS_DISTANCE_PROC);
+-	collation = index->rd_indcollation[0];
++	procinfo = kmeansInfo->procinfo;
++	collation = kmeansInfo->collation;
+ 
+ 	/* Choose an initial center uniformly at random */
+ 	VectorArraySet(centers, 0, VectorArrayGet(samples, RandomInt() % samples->length));
+@@ -120,11 +120,11 @@ NormCenters(const IvfflatTypeInfo * typeInfo, Oid collation, VectorArray centers
+  * Quick approach if we have no data
+  */
+ static void
+-RandomCenters(Relation index, VectorArray centers, const IvfflatTypeInfo * typeInfo)
++RandomCenters(Relation index, VectorArray centers, const IvfflatTypeInfo * typeInfo, const KmeansInfo * kmeansInfo)
+ {
+ 	int			dimensions = centers->dim;
+-	FmgrInfo   *normprocinfo = IvfflatOptionalProcInfo(index, IVFFLAT_KMEANS_NORM_PROC);
+-	Oid			collation = index->rd_indcollation[0];
++	FmgrInfo   *normprocinfo = kmeansInfo->normprocinfo;
++	Oid			collation = kmeansInfo->collation;
+ 	float	   *x = (float *) palloc(sizeof(float) * dimensions);
+ 
+ 	/* Fill with random data */
+@@ -256,7 +256,7 @@ ComputeNewCenters(VectorArray samples, float *agg, VectorArray newCenters, int *
+  * https://www.aaai.org/Papers/ICML/2003/ICML03-022.pdf
+  */
+ static void
+-ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo)
++ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo, const KmeansInfo * kmeansInfo)
+ {
+ 	FmgrInfo   *procinfo;
+ 	FmgrInfo   *normprocinfo;
+@@ -303,9 +303,9 @@ ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const Ivff
+ 		elog(ERROR, "Indexing overflow detected. Please report a bug.");
+ 
+ 	/* Set support functions */
+-	procinfo = index_getprocinfo(index, 1, IVFFLAT_KMEANS_DISTANCE_PROC);
+-	normprocinfo = IvfflatOptionalProcInfo(index, IVFFLAT_KMEANS_NORM_PROC);
+-	collation = index->rd_indcollation[0];
++	procinfo = kmeansInfo->procinfo;
++	normprocinfo = kmeansInfo->normprocinfo;
++	collation = kmeansInfo->collation;
+ 
+ 	/* Allocate space */
+ 	/* Use float instead of double to save memory */
+@@ -327,7 +327,7 @@ ElkanKmeans(Relation index, VectorArray samples, VectorArray centers, const Ivff
+ #endif
+ 
+ 	/* Pick initial centers */
+-	InitCenters(index, samples, centers, lowerBound);
++	InitCenters(index, samples, centers, lowerBound, kmeansInfo);
+ 
+ 	/* Assign each x to its closest initial center c(x) = argmin d(x,c) */
+ 	for (int64 j = 0; j < numSamples; j++)
+@@ -560,7 +560,7 @@ CheckCenters(Relation index, VectorArray centers, const IvfflatTypeInfo * typeIn
+  * We use spherical k-means for inner product and cosine
+  */
+ void
+-IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo)
++IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const IvfflatTypeInfo * typeInfo, const KmeansInfo * kmeansInfo)
+ {
+ 	MemoryContext kmeansCtx = AllocSetContextCreate(CurrentMemoryContext,
+ 													"Ivfflat kmeans temporary context",
+@@ -568,9 +568,9 @@ IvfflatKmeans(Relation index, VectorArray samples, VectorArray centers, const Iv
+ 	MemoryContext oldCtx = MemoryContextSwitchTo(kmeansCtx);
+ 
+ 	if (samples->length == 0)
+-		RandomCenters(index, centers, typeInfo);
++		RandomCenters(index, centers, typeInfo, kmeansInfo);
+ 	else
+-		ElkanKmeans(index, samples, centers, typeInfo);
++		ElkanKmeans(index, samples, centers, typeInfo, kmeansInfo);
+ 
+ 	CheckCenters(index, centers, typeInfo);
+ 
+diff --git a/test/expected/hnsw_vector.out b/test/expected/hnsw_vector.out
+index 29ea724..a81a24f 100644
+--- a/test/expected/hnsw_vector.out
++++ b/test/expected/hnsw_vector.out
+@@ -3,6 +3,9 @@ SET enable_seqscan = off;
+ CREATE TABLE t (val vector(3));
+ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+ CREATE INDEX ON t USING hnsw (val vector_l2_ops);
++NOTICE:  hnsw index metadata created with little data
++DETAIL:  This will cause low recall.
++HINT:  Drop the index until the table has more data.
+ INSERT INTO t (val) VALUES ('[1,2,4]');
+ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+    val   
+@@ -26,6 +29,9 @@ SELECT COUNT(*) FROM t;
+ (1 row)
+ 
+ TRUNCATE t;
++NOTICE:  hnsw index metadata created with little data
++DETAIL:  This will cause low recall.
++HINT:  Drop the index until the table has more data.
+ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+  val 
+ -----
+@@ -104,6 +110,9 @@ DROP TABLE t;
+ CREATE TABLE t (val vector(3));
+ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+ CREATE INDEX ON t USING hnsw (val vector_l2_ops);
++NOTICE:  hnsw index metadata created with little data
++DETAIL:  This will cause low recall.
++HINT:  Drop the index until the table has more data.
+ SET hnsw.iterative_scan = strict_order;
+ SET hnsw.ef_search = 1;
+ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+@@ -130,6 +139,9 @@ DROP TABLE t;
+ CREATE UNLOGGED TABLE t (val vector(3));
+ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+ CREATE INDEX ON t USING hnsw (val vector_l2_ops);
++NOTICE:  hnsw index metadata created with little data
++DETAIL:  This will cause low recall.
++HINT:  Drop the index until the table has more data.
+ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+    val   
+ ---------
+diff --git a/test/t/012_hnsw_vector_build_recall.pl b/test/t/012_hnsw_vector_build_recall.pl
+index 9358874..860aa4f 100644
+--- a/test/t/012_hnsw_vector_build_recall.pl
++++ b/test/t/012_hnsw_vector_build_recall.pl
+@@ -55,7 +55,7 @@ $node->start;
+ $node->safe_psql("postgres", "CREATE EXTENSION vector;");
+ $node->safe_psql("postgres", "CREATE TABLE tst (i int4, v vector(3));");
+ $node->safe_psql("postgres",
+-	"INSERT INTO tst SELECT i, ARRAY[$array_sql] FROM generate_series(1, 10000) i;"
++	"INSERT INTO tst SELECT i, ARRAY[$array_sql] FROM generate_series(1, 30000) i;"
+ );
+ 
+ # Generate queries
+@@ -112,10 +112,12 @@ for my $i (0 .. $#operators)
+ 
+ 	# Build index in parallel on disk
+ 	# Set parallel_workers on table to use workers with low maintenance_work_mem
++	# NOTE: Due to PQ encoding, the required maintenance_work_mem changes, so we're increasing the setting value
++	# while tripling the amount of data inserted accordingly
+ 	($ret, $stdout, $stderr) = $node->psql("postgres", qq(
+ 		ALTER TABLE tst SET (parallel_workers = 2);
+ 		SET client_min_messages = DEBUG;
+-		SET maintenance_work_mem = '4MB';
++		SET maintenance_work_mem = '14MB';
+ 		CREATE INDEX idx ON tst USING hnsw (v $opclass);
+ 		ALTER TABLE tst RESET (parallel_workers);
+ 	));
+diff --git a/test/t/016_hnsw_inserts.pl b/test/t/016_hnsw_inserts.pl
+index 2b2f479..f45e41e 100644
+--- a/test/t/016_hnsw_inserts.pl
++++ b/test/t/016_hnsw_inserts.pl
+@@ -40,8 +40,10 @@ for my $i (1 .. 20)
+ 		}
+ 	);
+ 
++	# TODO When candidate pruning enabled, not all candidates can be returned, making results non-deterministic
+ 	my $count = $node->safe_psql("postgres", qq(
+ 		SET enable_seqscan = off;
++		SET hnsw.candidate_pruning = off;
+ 		SELECT COUNT(*) FROM (SELECT v FROM tst ORDER BY v <-> (SELECT v FROM tst LIMIT 1)) t;
+ 	));
+ 	is($count, 10);
+diff --git a/test/t/017_hnsw_filtering.pl b/test/t/017_hnsw_filtering.pl
+index afa2a1c..00b6a9d 100644
+--- a/test/t/017_hnsw_filtering.pl
++++ b/test/t/017_hnsw_filtering.pl
+@@ -19,8 +19,10 @@ $node->start;
+ $node->safe_psql("postgres", "CREATE EXTENSION vector;");
+ $node->safe_psql("postgres", "CREATE TABLE tst (i int4, v vector($dim), c int4, t text);");
+ $node->safe_psql("postgres", "CREATE TABLE cat (i int4 PRIMARY KEY, t text, b boolean);");
++# Increase the number of rows in tst because the cost of index access paths increases due to index size growth
++# from neighbor metadata, resulting in partial index not being selected in the last test
+ $node->safe_psql("postgres",
+-	"INSERT INTO tst SELECT i, ARRAY[$array_sql], i % $nc, 'test ' || i FROM generate_series(1, 10000) i;"
++	"INSERT INTO tst SELECT i, ARRAY[$array_sql], i % $nc, 'test ' || i FROM generate_series(1, 30000) i;"
+ );
+ $node->safe_psql("postgres",
+ 	"INSERT INTO cat SELECT i, 'cat ' || i, i % 5 = 0 FROM generate_series(1, $nc) i;"
+diff --git a/test/t/039_hnsw_cost.pl b/test/t/039_hnsw_cost.pl
+index 97ea5e7..96106e5 100644
+--- a/test/t/039_hnsw_cost.pl
++++ b/test/t/039_hnsw_cost.pl
+@@ -20,8 +20,10 @@ for my $dim (@dims)
+ 
+ 	# Create table and index
+ 	$node->safe_psql("postgres", "CREATE TABLE tst (i int4, v vector($dim));");
++	# Increase the number of rows in tst because the cost of index access paths increases due to index size growth
++	# from neighbor metadata, resulting in index scans not being selected in the follwoing tests
+ 	$node->safe_psql("postgres",
+-		"INSERT INTO tst SELECT i, ARRAY[$array_sql] FROM generate_series(1, 2000) i;"
++		"INSERT INTO tst SELECT i, ARRAY[$array_sql] FROM generate_series(1, 6000) i;"
+ 	);
+ 	$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops);");
+ 	$node->safe_psql("postgres", "ANALYZE tst;");
+@@ -44,7 +46,7 @@ for my $dim (@dims)
+ 	# Recreate index for performance
+ 	$node->safe_psql("postgres", "DROP INDEX idx;");
+ 	$node->safe_psql("postgres",
+-		"INSERT INTO tst SELECT i, ARRAY[$array_sql] FROM generate_series(2001, 6000) i;"
++		"INSERT INTO tst SELECT i, ARRAY[$array_sql] FROM generate_series(6001, 18000) i;"
+ 	);
+ 	$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops);");
+ 	$node->safe_psql("postgres", "ANALYZE tst;");
+diff --git a/test/t/043_hnsw_iterative_scan.pl b/test/t/043_hnsw_iterative_scan.pl
+index e75c697..23f8fff 100644
+--- a/test/t/043_hnsw_iterative_scan.pl
++++ b/test/t/043_hnsw_iterative_scan.pl
+@@ -24,11 +24,13 @@ $node->safe_psql("postgres", qq(
+ 	CREATE INDEX ON tst USING hnsw (v vector_l2_ops)
+ ));
+ 
++# TODO When candidate pruning enabled, not all candidates can be returned, making results non-deterministic
+ my $count = $node->safe_psql("postgres", qq(
+ 	SET enable_seqscan = off;
+ 	SET hnsw.iterative_scan = relaxed_order;
+ 	SET hnsw.max_scan_tuples = 100000;
+ 	SET hnsw.scan_mem_multiplier = 2;
++	SET hnsw.candidate_pruning = off;
+ 	SELECT COUNT(*) FROM (SELECT v FROM tst WHERE i % 10000 = 0 ORDER BY v <-> (SELECT v FROM tst LIMIT 1) LIMIT 11) t;
+ ));
+ is($count, 10);

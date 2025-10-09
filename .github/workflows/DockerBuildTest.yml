@@ -1,0 +1,117 @@
+name: Validate Dockerfile builds pgvector artifacts
+
+on:
+  push:
+    paths:
+      - '.github/workflows/DockerBuildTest.yml'
+      - 'Dockerfile'
+      - '*.patch'
+
+env:
+  PG_MAJOR: "17"
+  PGVECTOR_REF: "v0.8.0"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    name: Build & verify artifacts (${{ matrix.patch_name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        patch_file:
+          - "pgvector_v0.8.0_hnsw_two_stage_pq.patch"
+        include:
+          - patch_file: "pgvector_v0.8.0_hnsw_two_stage_pq.patch"
+            patch_name: "PQ"
+    env:
+      DOCKER_BUILDKIT: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Build
+        run: |
+          set -euxo pipefail
+          IMAGE_TAG="pgvector-artifacts:pg${PG_MAJOR}-${PGVECTOR_REF}-${{ matrix.patch_name }}"
+          docker buildx build \
+            --build-arg PG_MAJOR="${PG_MAJOR}" \
+            --build-arg PGVECTOR_REF="${PGVECTOR_REF}" \
+            --build-arg PATCH_FILE="${{ matrix.patch_file }}" \
+            --tag "${IMAGE_TAG}" \
+            --load \
+            .
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: Extract /artifacts
+        run: |
+          set -euxo pipefail
+          docker image inspect "${IMAGE_TAG}" >/dev/null
+          cid="$(docker create "${IMAGE_TAG}")"
+          trap 'docker rm -f "$cid" >/dev/null || true' EXIT
+          rm -rf artifacts
+          mkdir -p artifacts
+          docker cp "$cid":/artifacts/. ./artifacts
+          find artifacts -maxdepth 2 -type f -print || true
+
+      - name: Verify expected files
+        run: |
+          set -euxo pipefail
+          if [ -d artifacts/artifacts ]; then shopt -s dotglob; mv artifacts/artifacts/* artifacts/; rmdir artifacts/artifacts; fi
+          ls -l artifacts || true
+          ls -l artifacts/lib || true
+          ls -l artifacts/extension || true
+          test -f artifacts/lib/vector.so
+          test -f artifacts/extension/vector.control
+          ls artifacts/extension/vector--*.sql | grep -q .
+          ls artifacts/*.tar.gz | grep -q .
+          test -s artifacts/lib/vector.so
+
+      - name: Upload extracted artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgvector-${{ matrix.patch_name }}-${{ env.PGVECTOR_REF }}-pg${{ env.PG_MAJOR }}-docker-linux-amd64
+          path: artifacts
+
+      - name: Build out stage to dist or fallback to docker cp
+        run: |
+          set -euxo pipefail
+          rm -rf dist && mkdir -p dist
+          if docker buildx build \
+               --build-arg PG_MAJOR="${PG_MAJOR}" \
+               --build-arg PGVECTOR_REF="${PGVECTOR_REF}" \
+               --build-arg PATCH_FILE="${{ matrix.patch_file }}" \
+               --target out \
+               --output type=local,dest=./dist \
+               --progress=plain \
+               .; then
+            :
+          else
+            cid="$(docker create "${IMAGE_TAG}")"
+            trap 'docker rm -f "$cid" >/dev/null || true' EXIT
+            docker cp "$cid":/artifacts/. ./dist
+          fi
+          find dist -maxdepth 2 -type f -print || true
+
+      - name: Verify dist contents
+        run: |
+          set -euxo pipefail
+          ls -l dist || true
+          ls -l dist/lib || true
+          ls -l dist/extension || true
+          test -f dist/lib/vector.so
+          test -f dist/extension/vector.control
+          ls dist/extension/vector--*.sql | grep -q .
+          test -s dist/lib/vector.so
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgvector-${{ matrix.patch_name }}-${{ env.PGVECTOR_REF }}-pg${{ env.PG_MAJOR }}-docker-linux-amd64-dist
+          path: dist

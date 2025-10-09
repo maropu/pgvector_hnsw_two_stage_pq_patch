@@ -1,0 +1,247 @@
+name: pgvector tests (w/patches)
+
+on:
+  push:
+    paths:
+      - ".github/workflows/BuildAndTests.yml"
+      - "*.patch"
+
+env:
+  PG_MAJOR: "17"
+  PG_VERSION_FULL: "17.5"
+  PGVECTOR_REF: "v0.8.0"
+
+jobs:
+  # Job 1: SQL regression tests (pgvector/test/sql via make installcheck)
+  # NOTE: Matrix configuration is duplicated in both jobs due to GitHub Actions limitations
+  sql-tests-linux:
+    name: SQL tests (${{ matrix.patch_name }}) on Linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        patch_file:
+          - "pgvector_v0.8.0_hnsw_two_stage_pq.patch"
+        include:
+          - patch_file: "pgvector_v0.8.0_hnsw_two_stage_pq.patch"
+            patch_name: "PQ"
+
+    # NOTE: 'container.image' cannot use the 'env' context at compile time.
+    # If PG_MAJOR is changed above, update this tag accordingly.
+    container:
+      image: postgres:17-bookworm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            postgresql-server-dev-$PG_MAJOR \
+            ca-certificates \
+            git \
+            patch
+
+      - name: Fetch pgvector source
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector
+          cd /tmp/pgvector
+          git fetch --tags --depth 1 origin "$PGVECTOR_REF"
+          git checkout "$PGVECTOR_REF"
+          git --no-pager log -1 --oneline
+
+      - name: Apply ${{ matrix.patch_name }} patch
+        working-directory: /tmp/pgvector
+        run: |
+          set -eux
+          test -f "${GITHUB_WORKSPACE}/${{ matrix.patch_file }}"
+          echo "Applying patch: ${{ matrix.patch_file }}"
+          patch -p1 < "${GITHUB_WORKSPACE}/${{ matrix.patch_file }}"
+
+      - name: Build & install extension
+        working-directory: /tmp/pgvector
+        run: |
+          set -eux
+          make clean
+          make OPTFLAGS=""
+          make install
+
+      - name: Start temporary PostgreSQL cluster
+        run: |
+          set -eux
+          BIN="/usr/lib/postgresql/${PG_MAJOR}/bin"
+          export PATH="$BIN:$PATH"
+
+          # Create and chown required dirs
+          install -d -o postgres -g postgres /var/lib/postgresql/data
+          install -d -o postgres -g postgres /var/run/postgresql
+
+          # Initialize and start as the 'postgres' user
+          gosu postgres "$BIN/initdb" -D /var/lib/postgresql/data -A trust --no-locale
+          gosu postgres "$BIN/pg_ctl" -D /var/lib/postgresql/data -o "-k /var/run/postgresql -p 5432" -l /tmp/pg.log start
+
+          # Wait until server is ready
+          "$BIN/pg_isready" -h /var/run/postgresql -p 5432 -t 60
+          echo "PostgreSQL started (unix socket: /var/run/postgresql, port 5432)."
+
+      - name: Run SQL regression (make installcheck)
+        working-directory: /tmp/pgvector
+        env:
+          PGHOST: /var/run/postgresql
+          PGPORT: 5432
+          PGUSER: postgres
+        run: |
+          set -eux
+          make installcheck
+          cat regression.diffs || true
+          ls -al results || true
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: |
+          set -eux
+          BIN="/usr/lib/postgresql/${PG_MAJOR}/bin"
+          gosu postgres "$BIN/pg_ctl" -D /var/lib/postgresql/data -m fast stop
+          echo "PostgreSQL stopped."
+
+      - name: Upload SQL test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-results-${{ matrix.patch_name }}-${{ env.PGVECTOR_REF }}-pg${{ env.PG_MAJOR }}
+          path: |
+            /tmp/pgvector/regression.diffs
+            /tmp/pgvector/results
+          if-no-files-found: warn
+
+  # Job 2: TAP integration tests (pgvector/test/t via prove)
+  tap-tests-linux:
+    name: TAP tests (${{ matrix.patch_name }}) on Linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        patch_file:
+          - "pgvector_v0.8.0_hnsw_two_stage_pq.patch"
+        include:
+          - patch_file: "pgvector_v0.8.0_hnsw_two_stage_pq.patch"
+            patch_name: "PQ"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show constants
+        run: |
+          echo "PG_VERSION_FULL=$PG_VERSION_FULL"
+          echo "PGVECTOR_REF=$PGVECTOR_REF"
+          echo "PATCH_FILE=${{ matrix.patch_file }}"
+          echo "PATCH_NAME=${{ matrix.patch_name }}"
+          echo "Base image: postgres:17-bookworm"
+
+      - name: Derive PATHs for TAP
+        run: |
+          set -eux
+          echo "POSTGRESQL_HOME=${GITHUB_WORKSPACE}/pgsql-${PG_VERSION_FULL}" >> "$GITHUB_ENV"
+          echo "POSTGRESQL_SRC=${GITHUB_WORKSPACE}/postgresql-${PG_VERSION_FULL}" >> "$GITHUB_ENV"
+          echo "PGDATA=${GITHUB_WORKSPACE}/pgdata" >> "$GITHUB_ENV"
+          echo "PG_REGRESS=${GITHUB_WORKSPACE}/postgresql-${PG_VERSION_FULL}/src/test/regress/pg_regress" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            wget \
+            tar \
+            bison \
+            flex \
+            libreadline-dev \
+            zlib1g-dev \
+            pkg-config \
+            perl \
+            cpanminus \
+            git \
+            patch
+
+      - name: Install Perl module(s) for TAP (IPC::Run)
+        run: |
+          set -eux
+          sudo cpanm -n IPC::Run
+
+      - name: Fetch and build PostgreSQL from source (enable TAP)
+        run: |
+          set -eux
+          cd "${GITHUB_WORKSPACE}"
+          curl -sSL "https://ftp.postgresql.org/pub/source/v${PG_VERSION_FULL}/postgresql-${PG_VERSION_FULL}.tar.gz" -o "postgresql-${PG_VERSION_FULL}.tar.gz"
+          tar -xzf "postgresql-${PG_VERSION_FULL}.tar.gz"
+          cd "postgresql-${PG_VERSION_FULL}"
+          ./configure --prefix="${POSTGRESQL_HOME}" --enable-tap-tests --without-icu
+          make -j2
+          make install
+
+      - name: Prepare PATH and env (initdb not required for TAP)
+        run: |
+          set -eux
+          echo "${POSTGRESQL_HOME}/bin" >> "$GITHUB_PATH"
+          mkdir -p "${PGDATA}"
+
+      - name: Fetch pgvector source
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector
+          cd /tmp/pgvector
+          git fetch --tags --depth 1 origin "$PGVECTOR_REF"
+          git checkout "$PGVECTOR_REF"
+          git --no-pager log -1 --oneline
+
+      - name: Apply ${{ matrix.patch_name }} patch
+        working-directory: /tmp/pgvector
+        run: |
+          set -eux
+          test -f "${GITHUB_WORKSPACE}/${{ matrix.patch_file }}"
+          echo "Applying patch: ${{ matrix.patch_file }}"
+          patch -p1 < "${GITHUB_WORKSPACE}/${{ matrix.patch_file }}"
+
+      - name: Move under PostgreSQL contrib
+        run: |
+          set -eux
+          mv /tmp/pgvector "${POSTGRESQL_SRC}/contrib/pgvector"
+
+      - name: Build & install pgvector (as contrib)
+        run: |
+          set -eux
+          cd "${POSTGRESQL_SRC}/contrib/pgvector"
+          make clean
+          make
+          make install
+
+      - name: Run TAP tests via prove
+        run: |
+          set -euo pipefail
+          set -x
+          cd "${POSTGRESQL_SRC}/contrib/pgvector"
+          prove -I "${POSTGRESQL_SRC}/src/test/perl/" test/t/*.pl |& tee "$GITHUB_WORKSPACE/tap-output-${{ matrix.patch_name }}.txt"
+
+      - name: Collect TAP logs
+        if: always()
+        run: |
+          set -eux
+          mv "${POSTGRESQL_SRC}/contrib/pgvector/log" "$GITHUB_WORKSPACE/tap-logs-${{ matrix.patch_name }}"
+
+      - name: Upload TAP outputs and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tap-results-${{ matrix.patch_name }}-${{ env.PGVECTOR_REF }}-pg${{ env.PG_MAJOR }}
+          path: |
+            ${{ github.workspace }}/tap-output-${{ matrix.patch_name }}.txt
+            ${{ github.workspace }}/tap-logs-${{ matrix.patch_name }}
+          if-no-files-found: warn
