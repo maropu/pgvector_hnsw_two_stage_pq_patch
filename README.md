@@ -4,7 +4,11 @@
 
 ## What this patch does and how to apply it?
 
-XXX
+This patch adds a two-stage Product Quantization (PQ) logic to the pgvector HNSW implementation.
+Stage 1 stores a 16-byte PQ code per neighbor (neighbor metadata) to estimate distances during traversal and prune candidates.
+Stage 2 compresses element payloads using residual PQ to offset the neighbor-metadata overhead and prevent index-size bloat while preserving recall.
+PQ Codebooks are trained at build time by reusing the IVFFlat’s sampling and k-means logic in pgvector, persisted in dedicated codebook pages, and referenced via metapage extensions.
+See [DESIGNDOC.md](./DESIGNDOC.md) for the detailed implementation design.
 
 Apply the patch to pgvector and compile it as described below:
 
@@ -20,9 +24,6 @@ $ patch -p1 < pgvector_v0.8.0_hnsw_two_stage_pq.patch
 $ make
 $ make install
 ```
-
-Note that **this patch is incompatible with the pgvector’s original index data format** because it adds 16 bytes per-neighbor metadata, and
-it currently supports only the L2 distance (vector_l2_ops) on single-precision floating-point vectors.
 
 ### Additional options
 
@@ -50,16 +51,7 @@ SET hnsw.distance_computation_topk = 3;
 
 A higher value provides better recall at the cost of block accesses.
 
-## Benchmark results
-
-XXX
-
 ## TODO
 
- - XXX
-
-
-## References
-
- - [1] XXX
-
+ - Update [DESIGNDOC.md](./DESIGNDOC.md) and proceed with implementation accordingly
+ - Add experimental results to README.md
