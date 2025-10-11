@@ -7,7 +7,7 @@
 This patch adds a two-stage Product Quantization (PQ) logic to the pgvector HNSW implementation.
 Stage 1 stores a 16-byte PQ code per neighbor (neighbor metadata) to estimate distances during traversal and prune candidates.
 Stage 2 compresses element payloads using residual PQ to offset the neighbor-metadata overhead and prevent index-size bloat while preserving recall.
-PQ Codebooks are trained at build time by reusing the IVFFlat’s sampling and k-means logic in pgvector, persisted in dedicated codebook pages, and referenced via metapage extensions.
+PQ codebooks are trained at build time by reusing the IVFFlat’s sampling and k-means logic in pgvector, persisted in dedicated codebook pages, and referenced via metapage extensions.
 See [DESIGNDOC.md](./DESIGNDOC.md) for the detailed implementation design.
 
 Apply the patch to pgvector and compile it as described below:
