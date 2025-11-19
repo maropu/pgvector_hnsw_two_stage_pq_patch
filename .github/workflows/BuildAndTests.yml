@@ -1,4 +1,4 @@
-name: pgvector tests (w/patches)
+name: pgvector tests (w/patch)
 
 on:
   push:

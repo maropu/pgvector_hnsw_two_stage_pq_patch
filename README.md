@@ -53,5 +53,4 @@ A higher value provides better recall at the cost of block accesses.
 
 ## TODO
 
- - Update [DESIGNDOC.md](./DESIGNDOC.md) and proceed with implementation accordingly
  - Add experimental results to README.md
