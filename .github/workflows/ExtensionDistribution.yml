@@ -117,7 +117,7 @@ jobs:
   # ===== macOS (osx/amd64) build on Intel runner =====
   build-macos-amd64:
     name: macOS amd64 (${{ matrix.patch_name }}, Intel)
-    runs-on: macos-13
+    runs-on: macos-12
     strategy:
       fail-fast: false
       matrix:
