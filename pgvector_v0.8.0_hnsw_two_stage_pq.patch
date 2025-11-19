@@ -1012,10 +1012,10 @@ index a5fac4e..a4f9c47 100644
  	MemoryContextSwitchTo(oldCtx);
 diff --git a/src/hnswpq.c b/src/hnswpq.c
 new file mode 100644
-index 0000000..01d4831
+index 0000000..3f5f799
 --- /dev/null
 +++ b/src/hnswpq.c
-@@ -0,0 +1,1304 @@
+@@ -0,0 +1,1281 @@
 +#include "postgres.h"
 +
 +#include <float.h>
@@ -2256,77 +2256,54 @@ index 0000000..01d4831
 +Datum
 +LoadVectorFromHeap(HnswElement element, Relation heap, Relation index, HnswSupport *support)
 +{
-+#if PG_VERSION_NUM < 170000
-+	HeapTuple	heapTuple;
-+#endif
-+	TupleDesc	tupleDesc;
-+	AttrNumber	vectorAttno;
-+	Datum		vd;
-+	Vector	   *v = NULL;
-+	bool		isnull;
++	HeapTupleData	htup;
++	TupleDesc		tupleDesc;
++	ItemPointer		tid = &element->heaptids[0];
++	AttrNumber		vectorAttno;
++	Datum			vd;
++	Vector		   *v = NULL;
++	bool			isnull;
++	Buffer			buf = InvalidBuffer;
++	bool			found;
 +
-+#if PG_VERSION_NUM >= 170000
-+	{
-+		HeapTupleData htup;
-+		Buffer		buf = InvalidBuffer;
-+		bool		found;
++	Assert(element->heaptidsLength > 0 && ItemPointerIsValid(tid));
 +
-+		/* Initialize temporary HeapTupleData with target TID */
-+		htup.t_self = element->heaptids[0];
++	/* Initialize temporary HeapTupleData with target TID */
++	htup.t_self = *tid;
 +
-+		found = heap_fetch(heap, SnapshotAny, &htup, &buf, false);
-+		if (!found)
-+			return PointerGetDatum(NULL);
-+
-+		tupleDesc = RelationGetDescr(heap);
-+
-+		/* Use first column from index definition */
-+		vectorAttno = index->rd_index->indkey.values[0];
-+
-+		vd = heap_getattr(&htup, vectorAttno, tupleDesc, &isnull);
-+
-+		if (!isnull)
-+		{
-+			Vector *sv = DatumGetVector(vd);
-+			v = InitVector(sv->dim);
-+			memcpy(v, sv, VARSIZE(sv));
-+		}
-+
-+		/* Release buffer acquired by heap_fetch */
-+		if (BufferIsValid(buf))
-+			ReleaseBuffer(buf);
-+
-+		return PointerGetDatum(v);
-+	}
-+#else
-+	/* Fetch heap tuple (pre-17 API expects to return HeapTuple) */
-+	heapTuple = heap_fetch(heap, SnapshotAny, &element->heaptids[0], NULL, false);
-+	if (!HeapTupleIsValid(heapTuple))
-+		return PointerGetDatum(NULL);
++	found = heap_fetch(heap, SnapshotAny, &htup, &buf, false);
++	if (!found)
++		elog(ERROR, "failed to fetch heap tuple for TID (%u,%u)",
++			 ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
 +
 +	tupleDesc = RelationGetDescr(heap);
++
++	/* Use first column from index definition */
 +	vectorAttno = index->rd_index->indkey.values[0];
-+	vd = heap_getattr(heapTuple, vectorAttno, tupleDesc, &isnull);
 +
-+	if (!isnull)
-+	{
-+		Vector *sv = DatumGetVector(vd);
-+		v = InitVector(sv->dim);
-+		memcpy(v, sv, VARSIZE(sv));
-+	}
++	vd = heap_getattr(&htup, vectorAttno, tupleDesc, &isnull);
++	if (isnull)
++		elog(ERROR, "vector column is NULL for TID (%u,%u)",
++			 ItemPointerGetBlockNumber(tid), ItemPointerGetOffsetNumber(tid));
 +
-+	heap_freetuple(heapTuple);
++	/* Copy the result to local */
++	Vector *sv = DatumGetVector(vd);
++	v = InitVector(sv->dim);
++	memcpy(v, sv, VARSIZE(sv));
++
++	/* Release buffer acquired by heap_fetch */
++	if (BufferIsValid(buf))
++		ReleaseBuffer(buf);
 +
 +	return PointerGetDatum(v);
-+#endif
 +}
 \ No newline at end of file
 diff --git a/src/hnswpq.h b/src/hnswpq.h
 new file mode 100644
-index 0000000..fc82abe
+index 0000000..bcbb870
 --- /dev/null
 +++ b/src/hnswpq.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,105 @@
 +#ifndef HNSW_SIMHASH_H
 +#define HNSW_SIMHASH_H
 +
@@ -2337,6 +2314,10 @@ index 0000000..fc82abe
 +#include "hnsw.h"
 +#include "ivfflat.h"			/* For reusing some structs and functions */
 +#include "utils/relcache.h"
++
++#if PG_VERSION_NUM < 170000
++#error "pgvector HNSW (w/two-stage PQ) requires PostgreSQL 17 or later"
++#endif
 +
 +/*
 + * Product Quantization
@@ -3392,7 +3373,7 @@ index 7afed25..e927493 100644
  
  	PG_RETURN_POINTER(&typeInfo);
 diff --git a/src/hnswvacuum.c b/src/hnswvacuum.c
-index 251d9d9..26c1ba4 100644
+index 251d9d9..4bdbcc0 100644
 --- a/src/hnswvacuum.c
 +++ b/src/hnswvacuum.c
 @@ -3,11 +3,15 @@
@@ -3492,7 +3473,7 @@ index 251d9d9..26c1ba4 100644
  
  	/* Get neighbor page */
  	buf = ReadBufferExtended(index, MAIN_FORKNUM, element->neighborPage, RBM_NORMAL, bas);
-@@ -228,7 +237,27 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
+@@ -228,7 +237,24 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
  	UnlockReleaseBuffer(buf);
  
  	/* Update neighbors */
@@ -3504,24 +3485,21 @@ index 251d9d9..26c1ba4 100644
 +LoadElementAndVectorFromHeap(HnswElement element, HnswElementTuple etup, Relation heap, Relation index, HnswSupport * support, void * pqstate)
 +{
 +	Datum	hv;
-+	Datum	value;
 +	char   *base = NULL;
 +
 +	/* Load element info without loading vector from element tuple */
 +	if (etup != NULL)
-+		HnswLoadElementFromTuple(element, etup, false, false, index, support, NULL, NULL);
++		HnswLoadElementFromTuple(element, etup, true, false, index, support, NULL, NULL);
 +	else
 +		HnswLoadElement(element, NULL, NULL, index, support, false, NULL, pqstate, NULL);
 +
 +	/* Then, load original vector from heap for lossy PQ representation */
 +	hv = LoadVectorFromHeap(element, heap, index, support);
-+	value = datumCopy(hv, false, -1);
-+	HnswPtrStore(base, element->value, DatumGetPointer(value));
-+	pfree(DatumGetPointer(hv));
++	HnswPtrStore(base, element->value, DatumGetPointer(hv));
  }
  
  /*
-@@ -238,9 +267,11 @@ static void
+@@ -238,9 +264,11 @@ static void
  RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
  {
  	Relation	index = vacuumstate->index;
@@ -3533,7 +3511,7 @@ index 251d9d9..26c1ba4 100644
  	MemoryContext oldCtx = MemoryContextSwitchTo(vacuumstate->tmpCtx);
  
  	if (!BlockNumberIsValid(highestPoint->blkno))
-@@ -256,11 +287,17 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+@@ -256,11 +284,17 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
  		LockPage(index, HNSW_UPDATE_LOCK, ShareLock);
  
  		/* Load element */
@@ -3553,7 +3531,7 @@ index 251d9d9..26c1ba4 100644
  
  		/* Release lock */
  		UnlockPage(index, HNSW_UPDATE_LOCK, ShareLock);
-@@ -270,7 +307,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+@@ -270,7 +304,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
  	LockPage(index, HNSW_UPDATE_LOCK, ExclusiveLock);
  
  	/* Get latest entry point */
@@ -3562,7 +3540,7 @@ index 251d9d9..26c1ba4 100644
  
  	if (entryPoint != NULL)
  	{
-@@ -285,7 +322,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+@@ -285,7 +319,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
  			 * point is outdated and empty, the entry point will be empty
  			 * until an element is repaired.
  			 */
@@ -3571,7 +3549,7 @@ index 251d9d9..26c1ba4 100644
  		}
  		else
  		{
-@@ -294,7 +331,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+@@ -294,7 +328,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
  			 * is outdated, this can remove connections at higher levels in
  			 * the graph until they are repaired, but this should be fine.
  			 */
@@ -3580,7 +3558,7 @@ index 251d9d9..26c1ba4 100644
  
  			if (NeedsUpdated(vacuumstate, entryPoint))
  			{
-@@ -302,7 +339,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+@@ -302,7 +336,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
  				if (highestPoint != NULL)
  					HnswPtrStore((char *) NULL, highestPoint->neighbors, (HnswNeighborArrayPtr *) NULL);
  
@@ -3589,7 +3567,7 @@ index 251d9d9..26c1ba4 100644
  			}
  		}
  	}
-@@ -321,9 +358,10 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
+@@ -321,9 +355,10 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
  static void
  RepairGraph(HnswVacuumState * vacuumstate)
  {
@@ -3601,7 +3579,7 @@ index 251d9d9..26c1ba4 100644
  
  	/*
  	 * Wait for inserts to complete. Inserts before this point may have
-@@ -370,7 +408,11 @@ RepairGraph(HnswVacuumState * vacuumstate)
+@@ -370,7 +405,11 @@ RepairGraph(HnswVacuumState * vacuumstate)
  
  			/* Create an element */
  			element = HnswInitElementFromBlock(blkno, offno);
@@ -3614,7 +3592,7 @@ index 251d9d9..26c1ba4 100644
  
  			elements = lappend(elements, element);
  		}
-@@ -384,6 +426,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
+@@ -384,6 +423,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
  		{
  			HnswElement element = (HnswElement) lfirst(lc2);
  			HnswElement entryPoint;
@@ -3622,7 +3600,7 @@ index 251d9d9..26c1ba4 100644
  			LOCKMODE	lockmode = ShareLock;
  
  			/* Check if any neighbors point to deleted values */
-@@ -394,7 +437,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
+@@ -394,7 +434,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
  			LockPage(index, HNSW_UPDATE_LOCK, lockmode);
  
  			/* Refresh entry point for each element */
@@ -3631,7 +3609,7 @@ index 251d9d9..26c1ba4 100644
  
  			/* Prevent concurrent inserts when likely updating entry point */
  			if (entryPoint == NULL || element->level > entryPoint->level)
-@@ -407,18 +450,18 @@ RepairGraph(HnswVacuumState * vacuumstate)
+@@ -407,18 +447,18 @@ RepairGraph(HnswVacuumState * vacuumstate)
  				LockPage(index, HNSW_UPDATE_LOCK, lockmode);
  
  				/* Get latest entry point after lock is acquired */
@@ -3653,7 +3631,7 @@ index 251d9d9..26c1ba4 100644
  
  			/* Release lock */
  			UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
-@@ -436,9 +479,11 @@ RepairGraph(HnswVacuumState * vacuumstate)
+@@ -436,9 +476,11 @@ RepairGraph(HnswVacuumState * vacuumstate)
  static void
  MarkDeleted(HnswVacuumState * vacuumstate)
  {
@@ -3666,7 +3644,7 @@ index 251d9d9..26c1ba4 100644
  	BufferAccessStrategy bas = vacuumstate->bas;
  
  	/*
-@@ -521,11 +566,18 @@ MarkDeleted(HnswVacuumState * vacuumstate)
+@@ -521,11 +563,18 @@ MarkDeleted(HnswVacuumState * vacuumstate)
  
  			/* Overwrite element */
  			etup->deleted = 1;
@@ -3687,7 +3665,7 @@ index 251d9d9..26c1ba4 100644
  
  			/* Increment version */
  			/* This is used to avoid incorrect reads for iterative scans */
-@@ -561,7 +613,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
+@@ -561,7 +610,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
  	}
  
  	/* Update insert page last, after everything has been marked as deleted */
@@ -3696,7 +3674,7 @@ index 251d9d9..26c1ba4 100644
  }
  
  /*
-@@ -589,7 +641,16 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
+@@ -589,7 +638,16 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
  	HnswInitSupport(&vacuumstate->support, index);
  
  	/* Get m from metapage */
@@ -3714,7 +3692,7 @@ index 251d9d9..26c1ba4 100644
  
  	/* Create hash table */
  	vacuumstate->deleted = tidhash_create(CurrentMemoryContext, 256, NULL);
-@@ -605,6 +666,10 @@ FreeVacuumState(HnswVacuumState * vacuumstate)
+@@ -605,6 +663,10 @@ FreeVacuumState(HnswVacuumState * vacuumstate)
  	FreeAccessStrategy(vacuumstate->bas);
  	pfree(vacuumstate->ntup);
  	MemoryContextDelete(vacuumstate->tmpCtx);
