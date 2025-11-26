@@ -25,19 +25,20 @@ index 8c62f9d..698f5ea 100644
  
  REGRESS = bit btree cast copy halfvec hnsw_bit hnsw_halfvec hnsw_sparsevec hnsw_vector ivfflat_bit ivfflat_halfvec ivfflat_vector sparsevec vector_type
 diff --git a/src/hnsw.c b/src/hnsw.c
-index 5bfc619..60c4503 100644
+index 5bfc619..8faa799 100644
 --- a/src/hnsw.c
 +++ b/src/hnsw.c
-@@ -30,6 +30,8 @@ int			hnsw_iterative_scan;
+@@ -30,6 +30,9 @@ int			hnsw_iterative_scan;
  int			hnsw_max_scan_tuples;
  double		hnsw_scan_mem_multiplier;
  int			hnsw_lock_tranche_id;
 +bool		hnsw_candidate_pruning;
 +int			hnsw_distance_computation_topk;
++int			hnsw_opq_rotation_iters;
  static relopt_kind hnsw_relopt_kind;
  
  /*
-@@ -74,6 +76,10 @@ HnswInit(void)
+@@ -74,6 +77,10 @@ HnswInit(void)
  					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
  	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
  					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
@@ -48,7 +49,7 @@ index 5bfc619..60c4503 100644
  
  	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
  							"Valid range is 1..1000.", &hnsw_ef_search,
-@@ -93,6 +99,14 @@ HnswInit(void)
+@@ -93,6 +100,18 @@ HnswInit(void)
  							 NULL, &hnsw_scan_mem_multiplier,
  							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
  
@@ -60,10 +61,14 @@ index 5bfc619..60c4503 100644
 +							NULL, &hnsw_distance_computation_topk,
 +							HNSW_DEFAULT_DISTANCE_COMPUTATION_TOPK, 1, HNSW_MAX_M * 2, PGC_USERSET, 0, NULL, NULL, NULL);
 +
++	DefineCustomIntVariable("hnsw.opq_rotation_iters", "Sets the number of OPQ rotation iterations for element compression",
++							"Valid range is 1..100.", &hnsw_opq_rotation_iters,
++							HNSW_DEFAULT_OPQ_ROTATION_ITERS, HNSW_MIN_OPQ_ROTATION_ITERS, HNSW_MAX_OPQ_ROTATION_ITERS, PGC_USERSET, 0, NULL, NULL, NULL);
++
  	MarkGUCPrefixReserved("hnsw");
  }
  
-@@ -149,7 +163,7 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+@@ -149,7 +168,7 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
  	genericcostestimate(root, path, loop_count, &costs);
  
  	index = index_open(path->indexinfo->indexoid, NoLock);
@@ -72,7 +77,7 @@ index 5bfc619..60c4503 100644
  	index_close(index, NoLock);
  
  	/*
-@@ -226,6 +240,8 @@ hnswoptions(Datum reloptions, bool validate)
+@@ -226,6 +245,8 @@ hnswoptions(Datum reloptions, bool validate)
  	static const relopt_parse_elt tab[] = {
  		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
  		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
@@ -82,10 +87,10 @@ index 5bfc619..60c4503 100644
  
  	return (bytea *) build_reloptions(reloptions, validate,
 diff --git a/src/hnsw.h b/src/hnsw.h
-index 1fb0c24..0528d1f 100644
+index 1fb0c24..14a5ddd 100644
 --- a/src/hnsw.h
 +++ b/src/hnsw.h
-@@ -37,15 +37,23 @@
+@@ -37,15 +37,26 @@
  #define HNSW_MIN_M	2
  #define HNSW_MAX_M		100
  #define HNSW_DEFAULT_EF_CONSTRUCTION	64
@@ -98,6 +103,9 @@ index 1fb0c24..0528d1f 100644
  #define HNSW_MAX_EF_SEARCH		1000
 +#define HNSW_DEFAULT_CANDIDATE_PRUNING			true
 +#define HNSW_DEFAULT_DISTANCE_COMPUTATION_TOPK	3
++#define HNSW_DEFAULT_OPQ_ROTATION_ITERS		10
++#define HNSW_MIN_OPQ_ROTATION_ITERS			1
++#define HNSW_MAX_OPQ_ROTATION_ITERS			100
  
  /* Tuple types */
  #define HNSW_ELEMENT_TUPLE_TYPE  1
@@ -109,7 +117,7 @@ index 1fb0c24..0528d1f 100644
  
  /* Make graph robust against non-HOT updates */
  #define HNSW_HEAPTIDS 10
-@@ -60,8 +68,13 @@
+@@ -60,8 +71,13 @@
  #define HNSW_MAX_SIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
  #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
  
@@ -124,7 +132,7 @@ index 1fb0c24..0528d1f 100644
  
  #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
  
-@@ -86,7 +99,7 @@
+@@ -86,7 +102,7 @@
  #define HnswGetMl(m) (1 / log(m))
  
  /* Ensure fits on page and in uint8 */
@@ -133,7 +141,7 @@ index 1fb0c24..0528d1f 100644
  
  #define HnswGetSearchCandidate(membername, ptr) pairingheap_container(HnswSearchCandidate, membername, ptr)
  #define HnswGetSearchCandidateConst(membername, ptr) pairingheap_const_container(HnswSearchCandidate, membername, ptr)
-@@ -107,12 +120,19 @@
+@@ -107,12 +123,20 @@
  #define HnswPtrPointer(hp) (hp).ptr
  #define HnswPtrOffset(hp) relptr_offset((hp).relptr)
  
@@ -150,10 +158,11 @@ index 1fb0c24..0528d1f 100644
  extern int	hnsw_lock_tranche_id;
 +extern bool hnsw_candidate_pruning;
 +extern int	hnsw_distance_computation_topk;
++extern int	hnsw_opq_rotation_iters;
  
  typedef enum HnswIterativeScanMode
  {
-@@ -158,6 +178,7 @@ typedef HnswElementData * HnswElement;
+@@ -158,6 +182,7 @@ typedef HnswElementData * HnswElement;
  typedef struct HnswCandidate
  {
  	HnswElementPtr element;
@@ -161,7 +170,7 @@ index 1fb0c24..0528d1f 100644
  	float		distance;
  	bool		closer;
  }			HnswCandidate;
-@@ -173,16 +194,20 @@ typedef struct HnswSearchCandidate
+@@ -173,16 +198,20 @@ typedef struct HnswSearchCandidate
  {
  	pairingheap_node c_node;
  	pairingheap_node w_node;
@@ -186,7 +195,7 @@ index 1fb0c24..0528d1f 100644
  }			HnswOptions;
  
  typedef struct HnswGraph
-@@ -214,6 +239,9 @@ typedef struct HnswShared
+@@ -214,6 +243,9 @@ typedef struct HnswShared
  	Oid			indexrelid;
  	bool		isconcurrent;
  
@@ -196,7 +205,7 @@ index 1fb0c24..0528d1f 100644
  	/* Worker progress */
  	ConditionVariable workersdonecv;
  
-@@ -244,12 +272,14 @@ typedef struct HnswAllocator
+@@ -244,12 +276,14 @@ typedef struct HnswAllocator
  	void	   *state;
  }			HnswAllocator;
  
@@ -216,7 +225,7 @@ index 1fb0c24..0528d1f 100644
  
  typedef struct HnswSupport
  {
-@@ -258,6 +288,20 @@ typedef struct HnswSupport
+@@ -258,6 +292,20 @@ typedef struct HnswSupport
  	Oid			collation;
  }			HnswSupport;
  
@@ -237,7 +246,7 @@ index 1fb0c24..0528d1f 100644
  typedef struct HnswQuery
  {
  	Datum		value;
-@@ -276,6 +320,8 @@ typedef struct HnswBuildState
+@@ -276,6 +324,8 @@ typedef struct HnswBuildState
  	int			dimensions;
  	int			m;
  	int			efConstruction;
@@ -246,7 +255,7 @@ index 1fb0c24..0528d1f 100644
  
  	/* Statistics */
  	double		indtuples;
-@@ -290,6 +336,17 @@ typedef struct HnswBuildState
+@@ -290,6 +340,17 @@ typedef struct HnswBuildState
  	double		ml;
  	int			maxLevel;
  
@@ -264,7 +273,7 @@ index 1fb0c24..0528d1f 100644
  	/* Memory */
  	MemoryContext graphCtx;
  	MemoryContext tmpCtx;
-@@ -301,6 +358,21 @@ typedef struct HnswBuildState
+@@ -301,6 +362,28 @@ typedef struct HnswBuildState
  	char	   *hnswarea;
  }			HnswBuildState;
  
@@ -276,17 +285,24 @@ index 1fb0c24..0528d1f 100644
 +	uint16		m;
 +}			HnswPQCodebookPageData;
 +
++typedef struct HnswOPQRotationPageData
++{
++	BlockNumber	startBlkno;
++	uint16		pageCount;
++}			HnswOPQRotationPageData;
++
 +typedef struct HnswPQPages
 +{
 +	bool					hasPqState;
-+	HnswPQCodebookPageData	nCodebookPages;
-+	HnswPQCodebookPageData	eCodebookPages;
++	HnswPQCodebookPageData	nCodebookPages;		/* PQ codebook for neighbor metadata */
++	HnswPQCodebookPageData	eCodebookPages;		/* OPQ codebook for element compression */
++	HnswOPQRotationPageData	eRotationPages;		/* OPQ rotation matrix pages */
 +}			HnswPQPages;
 +
  typedef struct HnswMetaPageData
  {
  	uint32		magicNumber;
-@@ -311,7 +383,14 @@ typedef struct HnswMetaPageData
+@@ -311,7 +394,14 @@ typedef struct HnswMetaPageData
  	BlockNumber entryBlkno;
  	OffsetNumber entryOffno;
  	int16		entryLevel;
@@ -301,7 +317,7 @@ index 1fb0c24..0528d1f 100644
  }			HnswMetaPageData;
  
  typedef HnswMetaPageData * HnswMetaPage;
-@@ -334,7 +413,8 @@ typedef struct HnswElementTupleData
+@@ -334,7 +424,8 @@ typedef struct HnswElementTupleData
  	ItemPointerData heaptids[HNSW_HEAPTIDS];
  	ItemPointerData neighbortid;
  	uint16		unused;
@@ -311,7 +327,7 @@ index 1fb0c24..0528d1f 100644
  }			HnswElementTupleData;
  
  typedef HnswElementTupleData * HnswElementTuple;
-@@ -344,7 +424,7 @@ typedef struct HnswNeighborTupleData
+@@ -344,7 +435,7 @@ typedef struct HnswNeighborTupleData
  	uint8		type;
  	uint8		version;
  	uint16		count;
@@ -320,7 +336,7 @@ index 1fb0c24..0528d1f 100644
  }			HnswNeighborTupleData;
  
  typedef HnswNeighborTupleData * HnswNeighborTuple;
-@@ -359,7 +439,7 @@ typedef union
+@@ -359,7 +450,7 @@ typedef union
  typedef union
  {
  	HnswElement element;
@@ -329,7 +345,7 @@ index 1fb0c24..0528d1f 100644
  }			HnswUnvisited;
  
  typedef struct HnswScanOpaqueData
-@@ -378,6 +458,9 @@ typedef struct HnswScanOpaqueData
+@@ -378,6 +469,9 @@ typedef struct HnswScanOpaqueData
  
  	/* Support functions */
  	HnswSupport support;
@@ -339,7 +355,7 @@ index 1fb0c24..0528d1f 100644
  }			HnswScanOpaqueData;
  
  typedef HnswScanOpaqueData * HnswScanOpaque;
-@@ -385,6 +468,7 @@ typedef HnswScanOpaqueData * HnswScanOpaque;
+@@ -385,6 +479,7 @@ typedef HnswScanOpaqueData * HnswScanOpaque;
  typedef struct HnswVacuumState
  {
  	/* Info */
@@ -347,7 +363,7 @@ index 1fb0c24..0528d1f 100644
  	Relation	index;
  	IndexBulkDeleteResult *stats;
  	IndexBulkDeleteCallback callback;
-@@ -397,6 +481,9 @@ typedef struct HnswVacuumState
+@@ -397,6 +492,9 @@ typedef struct HnswVacuumState
  	/* Support functions */
  	HnswSupport support;
  
@@ -357,14 +373,14 @@ index 1fb0c24..0528d1f 100644
  	/* Variables */
  	struct tidhash_hash *deleted;
  	BufferAccessStrategy bas;
-@@ -417,29 +504,31 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
+@@ -417,29 +515,31 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
  Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
  void		HnswInitPage(Buffer buf, Page page);
  void		HnswInit(void);
 -List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 -HnswElement HnswGetEntryPoint(Relation index);
 -void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
-+List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, void * pqstate, bool candidatePruning);
++List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, void * pqstate, bool candidatePruning, int distanceComputationTopK);
 +HnswElement HnswGetEntryPoint(Relation index, char *entryMetadata);
 +BlockNumber	HnswGetHeadBlockNumber(Relation index);
 +void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint, char *entryMetadata);
@@ -1012,10 +1028,10 @@ index a5fac4e..a4f9c47 100644
  	MemoryContextSwitchTo(oldCtx);
 diff --git a/src/hnswpq.c b/src/hnswpq.c
 new file mode 100644
-index 0000000..3f5f799
+index 0000000..cba1ac8
 --- /dev/null
 +++ b/src/hnswpq.c
-@@ -0,0 +1,1281 @@
+@@ -0,0 +1,1977 @@
 +#include "postgres.h"
 +
 +#include <float.h>
@@ -1083,6 +1099,365 @@ index 0000000..3f5f799
 +}
 +
 +/*
++ * Initialize rotation matrix as identity matrix
++ */
++static void
++InitIdentityMatrix(float *r, int dim)
++{
++	for (int i = 0; i < dim; i++)
++	{
++		for (int j = 0; j < dim; j++)
++			r[i * dim + j] = (i == j) ? 1.0f : 0.0f;
++	}
++}
++
++/*
++ * Rotate a single vector: dst = src * R^T (for encoding)
++ * src and dst should have dimension 'dim'
++ */
++static void
++RotateVector(float *dst, float *src, float *r, int dim)
++{
++	for (int i = 0; i < dim; i++)
++	{
++		float		sum = 0.0f;
++
++		for (int j = 0; j < dim; j++)
++			sum += src[j] * r[i * dim + j];
++
++		dst[i] = sum;
++	}
++}
++
++/*
++ * Inverse rotate a single vector: dst = src * R (for decoding)
++ * Since R is orthogonal, R^(-1) = R^T, so this computes src * R
++ */
++static void
++InverseRotateVector(float *dst, float *src, float *r, int dim)
++{
++	for (int i = 0; i < dim; i++)
++	{
++		float		sum = 0.0f;
++
++		for (int j = 0; j < dim; j++)
++			sum += src[j] * r[j * dim + i];
++
++		dst[i] = sum;
++	}
++}
++
++/*
++ * Internal PQ encoding helper function
++ * Encodes vector data (float array) into PQ codes using the given centroid state.
++ * This is the core encoding logic shared by both HnswPQEncodeVector and OPQEncodeVector.
++ */
++static void
++PQEncodeVectorInternal(uint8 *dst, float *data, int dim, HnswPQCentroidState *cstate, HnswSupport *support)
++{
++	Vector	   *sv = cstate->subvectorBuffer;
++
++	Assert(sv != NULL);
++
++	/* Encode each subvector */
++	for (int i = 0; i < cstate->m; i++)
++	{
++		int			startDim = i * cstate->subvectorDim;
++		int			endDim = Min(startDim + cstate->subvectorDim, dim);
++		int			actualSubvectorDim = endDim - startDim;
++		VectorArray	centroids = cstate->centroids[i];
++		int			bestCentroid = -1;
++		float		bestDistance = FLT_MAX;
++
++		/* Copy subvector data */
++		for (int d = 0; d < actualSubvectorDim; d++)
++			sv->x[d] = data[startDim + d];
++
++		/* Pad remaining dimensions with zeros */
++		for (int d = actualSubvectorDim; d < cstate->subvectorDim; d++)
++			sv->x[d] = 0.0f;
++
++		/* Find nearest centroid */
++		for (int c = 0; c < HNSW_PQ_NUM_CENTROIDS; c++)
++		{
++			Vector	   *centroidVec = (Vector *) VectorArrayGet(centroids, c);
++			double		distance = DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation,
++																	PointerGetDatum(sv), PointerGetDatum(centroidVec)));
++
++			if (distance < bestDistance)
++			{
++				bestDistance = (float) distance;
++				bestCentroid = c;
++			}
++		}
++
++		Assert(bestCentroid >= 0 && bestCentroid < HNSW_PQ_NUM_CENTROIDS);
++		dst[i] = (uint8) bestCentroid;
++	}
++}
++
++/*
++ * Encode vector using OPQ (rotate then PQ encode)
++ */
++static void
++OPQEncodeVector(uint8 *dst, Vector *vec, HnswOPQCentroidState *opqstate, HnswSupport *support)
++{
++	int		dim = opqstate->pq->dim;
++	float  *rotated = opqstate->encodeBuffer;
++
++	/* Rotate vector: rotated = vec * R^T */
++	RotateVector(rotated, vec->x, opqstate->r, dim);
++
++	/* PQ encode the rotated vector */
++	PQEncodeVectorInternal(dst, rotated, dim, opqstate->pq, support);
++}
++
++/*
++ * Generic PQ encoding function
++ */
++void
++HnswPQEncodeVector(uint8 *dst, Datum v, HnswPQCentroidState *cstate, HnswSupport *support, int maxBytes)
++{
++	Vector *vec = DatumGetVector(v);
++
++	/* PQ encode the vector */
++	PQEncodeVectorInternal(dst, vec->x, vec->dim, cstate, support);
++}
++
++/*
++ * Internal PQ decoding helper function
++ * Decodes PQ codes into vector data (float array) using the given centroid state.
++ * This is the core decoding logic shared by both HnswPQDecodeVector and OPQDecodeVector.
++ */
++static void
++PQDecodeVectorInternal(float *dst, uint8 *encoded, int dim, HnswPQCentroidState *cstate)
++{
++	for (int i = 0; i < cstate->m; i++)
++	{
++		int			startDim = i * cstate->subvectorDim;
++		int			endDim = Min(startDim + cstate->subvectorDim, dim);
++		int			actualSubvectorDim = endDim - startDim;
++		uint8		centroidIdx = encoded[i];
++		VectorArray	centroids = cstate->centroids[i];
++		Vector	   *centroidVec = (Vector *) VectorArrayGet(centroids, centroidIdx);
++
++		Assert(centroidIdx < HNSW_PQ_NUM_CENTROIDS);
++
++		/* Copy centroid data (only actual dimensions) */
++		for (int d = 0; d < actualSubvectorDim; d++)
++			dst[startDim + d] = centroidVec->x[d];
++	}
++}
++
++/*
++ * Decode vector using OPQ (PQ decode then inverse rotate)
++ */
++static void
++OPQDecodeVector(Vector *dst, uint8 *encoded, HnswOPQCentroidState *opqstate)
++{
++	int		dim = opqstate->pq->dim;
++	float  *decoded = opqstate->decodeBuffer;
++
++	/* PQ decode to rotated space */
++	PQDecodeVectorInternal(decoded, encoded, dim, opqstate->pq);
++
++	/* Inverse rotate: dst = decoded * R */
++	InverseRotateVector(dst->x, decoded, opqstate->r, dim);
++}
++
++/*
++ * Generic PQ decoding function
++ */
++void
++HnswPQDecodeVector(Datum dst, uint8 *encoded, HnswPQCentroidState *cstate, int dimensions)
++{
++	Vector *dv = DatumGetVector(dst);
++
++	/* PQ decode the vector */
++	PQDecodeVectorInternal(dv->x, encoded, dimensions, cstate);
++}
++
++/*
++ * Rotate sample vectors: X_rot = X * R^T
++ * samples: n x dim matrix (row-major, stored in VectorArray)
++ * r: dim x dim rotation matrix (row-major)
++ * Output is written back to samples array
++ */
++static void
++RotateSamples(VectorArray samples, float *r, int dim, float *tmpBuffer)
++{
++	for (int i = 0; i < samples->length; i++)
++	{
++		Vector	   *v = (Vector *) VectorArrayGet(samples, i);
++
++		RotateVector(tmpBuffer, v->x, r, dim);
++		memcpy(v->x, tmpBuffer, dim * sizeof(float));
++	}
++}
++
++/*
++ * Compute covariance matrix: cov = Y^T * X
++ * X: n x dim matrix (original samples)
++ * Y: n x dim matrix (reconstructed samples)
++ * cov: dim x dim output matrix
++ */
++static void
++ComputeCovariance(float *xData, float *yData, int n, int dim, float *cov)
++{
++	/* Initialize cov to zero */
++	memset(cov, 0, dim * dim * sizeof(float));
++
++	/* Compute cov = Y^T * X using simple triple loop (BLAS-independent) */
++	for (int i = 0; i < dim; i++)
++	{
++		for (int j = 0; j < dim; j++)
++		{
++			float		sum = 0.0f;
++
++			for (int k = 0; k < n; k++)
++				sum += yData[k * dim + i] * xData[k * dim + j];
++
++			cov[i * dim + j] = sum;
++		}
++	}
++}
++
++/*
++ * Compute SVD using Jacobi rotation method
++ * This is a simplified SVD implementation for Procrustes update (R = U * V^T)
++ * The input matrix 'cov' is modified in place during computation.
++ * u and v are pre-allocated dim x dim matrices for output.
++ */
++static void
++ComputeSvd(float *cov, int dim, float *u, float *v)
++{
++	const int	maxSweeps = 32;
++	const float	eps = 1e-6f;
++
++	/* Initialize U and V as identity matrices */
++	for (int i = 0; i < dim; i++)
++	{
++		for (int j = 0; j < dim; j++)
++		{
++			u[i * dim + j] = (i == j) ? 1.0f : 0.0f;
++			v[i * dim + j] = (i == j) ? 1.0f : 0.0f;
++		}
++	}
++
++	/* Jacobi rotation sweeps until convergence */
++	for (int sweep = 0; sweep < maxSweeps; sweep++)
++	{
++		float		offDiag = 0.0f;
++
++		for (int p = 0; p < dim; p++)
++		{
++			for (int q = p + 1; q < dim; q++)
++			{
++				float		app = cov[p * dim + p];
++				float		aqq = cov[q * dim + q];
++				float		apq = cov[p * dim + q];
++				float		tau;
++				float		t;
++				float		c;
++				float		s;
++
++				offDiag += fabsf(apq);
++
++				if (fabsf(apq) < eps)
++					continue;
++
++				tau = (aqq - app) / (2.0f * apq);
++				t = copysignf(1.0f / (fabsf(tau) + sqrtf(1.0f + tau * tau)), tau);
++				c = 1.0f / sqrtf(1.0f + t * t);
++				s = t * c;
++
++				/* Apply rotation to cov, U, and V */
++				for (int k = 0; k < dim; k++)
++				{
++					float		cpk = cov[p * dim + k];
++					float		cqk = cov[q * dim + k];
++					float		kup;
++					float		kuq;
++					float		kvp;
++					float		kvq;
++
++					cov[p * dim + k] = c * cpk - s * cqk;
++					cov[q * dim + k] = s * cpk + c * cqk;
++
++					kup = u[k * dim + p];
++					kuq = u[k * dim + q];
++
++					u[k * dim + p] = c * kup - s * kuq;
++					u[k * dim + q] = s * kup + c * kuq;
++
++					kvp = v[k * dim + p];
++					kvq = v[k * dim + q];
++
++					v[k * dim + p] = c * kvp - s * kvq;
++					v[k * dim + q] = s * kvp + c * kvq;
++				}
++			}
++		}
++
++		if (offDiag < eps)
++			break;
++	}
++}
++
++/*
++ * Procrustes update: compute R_new = U * V^T from cov = Y^T * X
++ * Requires pre-allocated buffers: cov (dim x dim), u (dim x dim), v (dim x dim)
++ */
++static void
++ProcrustesUpdate(float *xData, float *yData, int n, int dim, float *r, float *cov, float *u, float *v)
++{
++	/* Compute covariance: cov = Y^T * X */
++	ComputeCovariance(xData, yData, n, dim, cov);
++
++	/* Compute SVD of cov */
++	ComputeSvd(cov, dim, u, v);
++
++	/* Compute R = U * V^T */
++	for (int i = 0; i < dim; i++)
++	{
++		for (int j = 0; j < dim; j++)
++		{
++			float		sum = 0.0f;
++
++			for (int k = 0; k < dim; k++)
++				sum += u[i * dim + k] * v[j * dim + k];
++
++			r[i * dim + j] = sum;
++		}
++	}
++}
++
++/*
++ * Initialize an OPQ state structure with default values
++ */
++static HnswOPQCentroidState *
++InitOPQState(int dim, int subvectorDim)
++{
++	HnswOPQCentroidState *state = (HnswOPQCentroidState *) palloc(sizeof(HnswOPQCentroidState));
++
++	state->pq = (HnswPQCentroidState *) palloc(sizeof(HnswPQCentroidState));
++	state->pq->dim = dim;
++	state->pq->subvectorDim = subvectorDim;
++	state->pq->m = (dim + subvectorDim - 1) / subvectorDim;
++	state->r = (float *) palloc(dim * dim * sizeof(float));
++	state->encodeBuffer = (float *) palloc(dim * sizeof(float));
++	state->decodeBuffer = (float *) palloc(dim * sizeof(float));
++	state->residualBuffer = InitVector(dim);
++	state->pq->subvectorBuffer = InitVector(subvectorDim);
++	state->pq->centroids = NULL;
++
++	/* Initialize rotation matrix as identity */
++	InitIdentityMatrix(state->r, dim);
++
++	return state;
++}
++
++/*
 + * Initialize a PQ state structure with default values
 + */
 +static HnswPQCentroidState *
@@ -1091,9 +1466,11 @@ index 0000000..3f5f799
 +	HnswPQCentroidState *state = (HnswPQCentroidState *) palloc(sizeof(HnswPQCentroidState));
 +
 +	/* Initialize with default values */
++	state->dim = 0;
 +	state->m = 0;
 +	state->subvectorDim = 0;
 +	state->centroids = NULL;
++	state->subvectorBuffer = NULL;
 +
 +	return state;
 +}
@@ -1377,6 +1754,9 @@ index 0000000..3f5f799
 +	if (buildstate->dimensions % cstate->subvectorDim != 0)
 +		cstate->m++;
 +
++	/* Allocate working buffer for subvector */
++	cstate->subvectorBuffer = InitVector(cstate->subvectorDim);
++
 +	/* Train neighbor metadata PQ centroids */
 +	TrainPQCentroids(index, samples, cstate, buildstate);
 +}
@@ -1391,108 +1771,158 @@ index 0000000..3f5f799
 +}
 +
 +/*
-+ * Generic PQ encoding function
-+ */
-+void
-+HnswPQEncodeVector(uint8 *dst, Datum v, HnswPQCentroidState *cstate, HnswSupport *support, int maxBytes)
-+{
-+	Vector *vec = DatumGetVector(v);
-+	Vector *sv;
-+
-+	/* Initialize entire dst array with zeros */
-+	memset(dst, 0, maxBytes);
-+
-+	/* Create temporary subvector for reuse */
-+	sv = InitVector(cstate->subvectorDim);
-+
-+	/* Encode each subvector */
-+	for (int i = 0; i < cstate->m; i++)
-+	{
-+		int			startDim = i * cstate->subvectorDim;
-+		int			endDim = Min(startDim + cstate->subvectorDim, vec->dim);
-+		int			subvectorDim = endDim - startDim;
-+		VectorArray	centroids = cstate->centroids[i];
-+		int			bestCentroid = -1;
-+		float		bestDistance = FLT_MAX;
-+
-+		for (int d = 0; d < subvectorDim; d++)
-+			sv->x[d] = vec->x[startDim + d];
-+
-+		/* Initialize padding elements with 0.0f (if any) */
-+		for (int d = subvectorDim; d < cstate->subvectorDim; d++)
-+			sv->x[d] = 0.0f;
-+
-+		/* Find nearest centroid */
-+		for (int c = 0; c < HNSW_PQ_NUM_CENTROIDS; c++)
-+		{
-+			Vector	   *centroidVec = (Vector *) VectorArrayGet(centroids, c);
-+			double		distance = HnswGetDistance(PointerGetDatum(sv), PointerGetDatum(centroidVec), support);
-+
-+			if (distance < bestDistance)
-+			{
-+				bestDistance = (float) distance;
-+				bestCentroid = c;
-+			}
-+		}
-+
-+		Assert(bestCentroid >= 0 && bestCentroid < HNSW_PQ_NUM_CENTROIDS);
-+
-+		/* Store the index of the best centroid */
-+		dst[i] = (uint8) bestCentroid;
-+	}
-+
-+	pfree(sv);
-+}
-+
-+/*
-+ * Generic PQ decoding function
-+ */
-+void
-+HnswPQDecodeVector(Datum dst, uint8 *encoded, HnswPQCentroidState *cstate, int dimensions)
-+{
-+	Vector *dv = DatumGetVector(dst);
-+
-+	for (int i = 0; i < cstate->m; i++)
-+	{
-+		int			startDim = i * cstate->subvectorDim;
-+		int			endDim = Min(startDim + cstate->subvectorDim, dimensions);
-+		int			subvectorDim = endDim - startDim;
-+		uint8		centroidIdx = encoded[i];
-+		VectorArray	centroids = cstate->centroids[i];
-+
-+		Assert(centroidIdx >= 0 && centroidIdx < HNSW_PQ_NUM_CENTROIDS);
-+
-+		/* Get the centroid vector */
-+		Vector	   *centroidVec = (Vector *) VectorArrayGet(centroids, centroidIdx);
-+		float	   *centroidData = centroidVec->x;
-+
-+		/* Copy centroid data to output vector (only actual dimensions, skip padding) */
-+		for (int d = 0; d < subvectorDim; d++)
-+			dv->x[startDim + d] = centroidData[d];
-+	}
-+}
-+
-+/*
-+ * Train element PQ from residuals (when neighbor_metadata=on)
++ * Core OPQ training loop using alternating optimization.
++ * This is the shared implementation for both TrainElementOPQ and TrainElementOPQFromResiduals.
 + */
 +static void
-+TrainElementPQFromResiduals(Relation index, VectorArray samples, HnswBuildState * buildstate)
++TrainOPQCore(Relation index, VectorArray trainSamples, HnswOPQCentroidState *opqstate,
++			 HnswBuildState *buildstate, const char *logPrefix)
 +{
-+	HnswPQCentroidState	  *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(buildstate->pqState);
-+	HnswPQCentroidState	  *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(buildstate->pqState);
++	int				dim = opqstate->pq->dim;
++	int				n = trainSamples->length;
++	int				subvectorDim = opqstate->pq->subvectorDim;
++	int				rotationIters = hnsw_opq_rotation_iters;
++	int				itemSize = buildstate->typeInfo->itemSize(dim);
++	float		   *xData;			/* Working buffer for samples */
++	float		   *yData;			/* Working buffer for OPQ reconstructed samples */
++	float		   *tmpBuffer;		/* Working buffer for rotation */
++	float		   *cov;			/* Working buffer for Procrustes: covariance matrix */
++	float		   *svdU;			/* Working buffer for Procrustes: SVD U matrix */
++	float		   *svdV;			/* Working buffer for Procrustes: SVD V matrix */
++	VectorArray		rotatedSamples;	/* Working buffer for rotated samples */
++	Vector		   *decoded;		/* Working buffer for encode/decode */
++
++	/* Allocate working buffers */
++	xData = (float *) palloc(n * dim * sizeof(float));
++	yData = (float *) palloc(n * dim * sizeof(float));
++	tmpBuffer = (float *) palloc(dim * sizeof(float));
++	cov = (float *) palloc(dim * dim * sizeof(float));
++	svdU = (float *) palloc(dim * dim * sizeof(float));
++	svdV = (float *) palloc(dim * dim * sizeof(float));
++	rotatedSamples = VectorArrayInit(n, dim, itemSize);
++	rotatedSamples->length = n;
++	decoded = InitVector(dim);
++
++	/* Copy train samples to xData (n x dim matrix, row-major) */
++	for (int i = 0; i < n; i++)
++	{
++		Vector	   *v = (Vector *) VectorArrayGet(trainSamples, i);
++
++		memcpy(&xData[i * dim], v->x, dim * sizeof(float));
++	}
++
++	/* Initialize rotated samples with train data */
++	for (int i = 0; i < n; i++)
++	{
++		Vector	   *src = (Vector *) VectorArrayGet(trainSamples, i);
++		Vector	   *dst = (Vector *) VectorArrayGet(rotatedSamples, i);
++
++		SET_VARSIZE(dst, itemSize);
++		dst->dim = dim;
++		memcpy(dst->x, src->x, dim * sizeof(float));
++	}
++
++	elog(DEBUG1, "%s training started: dim=%d, m=%d, subvectorDim=%d, iters=%d, samples=%d",
++		 logPrefix, dim, opqstate->pq->m, subvectorDim, rotationIters, n);
++
++	/* Alternating optimization loop */
++	for (int iter = 0; iter < rotationIters; iter++)
++	{
++		/* Step 1: Rotate samples with current R */
++		RotateSamples(rotatedSamples, opqstate->r, dim, tmpBuffer);
++
++		/* Step 2: Train PQ centroids in rotated space */
++		{
++			HnswPQCentroidState tmpState;
++
++			tmpState.m = opqstate->pq->m;
++			tmpState.subvectorDim = subvectorDim;
++			tmpState.centroids = NULL;
++
++			TrainPQCentroids(index, rotatedSamples, &tmpState, buildstate);
++
++			/* Free old centroids if exist */
++			if (opqstate->pq->centroids != NULL)
++			{
++				for (int m = 0; m < opqstate->pq->m; m++)
++				{
++					if (opqstate->pq->centroids[m] != NULL)
++						VectorArrayFree(opqstate->pq->centroids[m]);
++				}
++
++				pfree(opqstate->pq->centroids);
++				opqstate->pq->centroids = NULL;
++			}
++
++			opqstate->pq->centroids = tmpState.centroids;
++		}
++
++		/* Step 3: Encode and decode to get reconstructed vectors Y */
++		for (int i = 0; i < n; i++)
++		{
++			Vector	   *v = (Vector *) VectorArrayGet(trainSamples, i);
++			uint8		encoded[HNSW_MAX_DIM];
++
++			Assert(opqstate->pq->m <= HNSW_MAX_DIM);
++
++			OPQEncodeVector(encoded, v, opqstate, &buildstate->support);
++			OPQDecodeVector(decoded, encoded, opqstate);
++
++			memcpy(&yData[i * dim], decoded->x, dim * sizeof(float));
++		}
++
++		/* Step 4: Procrustes update R = argmin ||Y - X * R^T|| */
++		ProcrustesUpdate(xData, yData, n, dim, opqstate->r, cov, svdU, svdV);
++
++		/* Reset rotated samples to original for next iteration */
++		for (int i = 0; i < n; i++)
++		{
++			Vector	   *dst = (Vector *) VectorArrayGet(rotatedSamples, i);
++
++			memcpy(dst->x, &xData[i * dim], dim * sizeof(float));
++		}
++
++		elog(DEBUG1, "%s iteration %d/%d completed", logPrefix, iter + 1, rotationIters);
++	}
++
++	/* Clean up working buffers */
++	pfree(xData);
++	pfree(yData);
++	pfree(tmpBuffer);
++	pfree(cov);
++	pfree(svdU);
++	pfree(svdV);
++	pfree(decoded);
++	VectorArrayFree(rotatedSamples);
++
++	elog(DEBUG1, "%s training completed", logPrefix);
++}
++
++/*
++ * Train element OPQ from residuals (when neighbor_metadata=on)
++ * Uses OPQ on residual vectors for better compression quality.
++ */
++static void
++TrainElementOPQFromResiduals(Relation index, VectorArray samples, HnswBuildState * buildstate)
++{
++	HnswPQState		   *pqstate = (HnswPQState *) buildstate->pqState;
++	HnswPQCentroidState	  *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate);
++	HnswOPQCentroidState  *opqstate;
 +	VectorArray		rsamples;
 +	Vector		   *tv;
 +	Vector		   *rv;
++	int				dim = buildstate->dimensions;
++	int				subvectorDim = HNSW_ELEMENT_PQ_SUBVECTOR_DIM;
 +	int				itemSize;
 +
 +	/* Create array for residual samples */
-+	itemSize = buildstate->typeInfo->itemSize(buildstate->dimensions);
-+	rsamples = VectorArrayInit(samples->length, buildstate->dimensions, itemSize);
++	itemSize = buildstate->typeInfo->itemSize(dim);
++	rsamples = VectorArrayInit(samples->length, dim, itemSize);
 +	rsamples->length = samples->length;
 +
 +	/* Allocate reusable vectors outside the loop */
-+	tv = InitVector(buildstate->dimensions);
-+	rv = InitVector(buildstate->dimensions);
++	tv = InitVector(dim);
++	rv = InitVector(dim);
 +
 +	/* For each sample, compute residual vector */
 +	for (int i = 0; i < samples->length; i++)
@@ -1507,7 +1937,7 @@ index 0000000..3f5f799
 +		HnswPQDecodeVector(PointerGetDatum(tv), encoded, nstate, tv->dim);
 +
 +		/* Step 3: Compute residual = original - reconstructed */
-+		for (int d = 0; d < v->dim; d++)
++		for (int d = 0; d < dim; d++)
 +			rv->x[d] = v->x[d] - tv->x[d];
 +
 +		/* Store residual in samples array */
@@ -1518,21 +1948,35 @@ index 0000000..3f5f799
 +	pfree(tv);
 +	pfree(rv);
 +
-+	/* Train PQ centroids on residual vectors */
-+	TrainPQCentroids(index, rsamples, estate, buildstate);
++	/* Initialize OPQ state */
++	opqstate = InitOPQState(dim, subvectorDim);
++	pqstate->elementCompressionState = opqstate;
 +
-+	/* Free residual samples */
++	/* Train OPQ on residual samples */
++	TrainOPQCore(index, rsamples, opqstate, buildstate, "Residual OPQ");
++
++	/* Clean up residual samples */
 +	VectorArrayFree(rsamples);
 +}
 +
 +/*
-+ * Train element PQ directly on original vectors (when neighbor_metadata=off)
++ * Train element OPQ using alternating optimization
++ * This trains both the rotation matrix R and the PQ codebook in rotated space
 + */
 +static void
-+TrainElementPQDirectly(Relation index, VectorArray samples, HnswBuildState * buildstate)
++TrainElementOPQ(Relation index, VectorArray samples, HnswBuildState * buildstate)
 +{
-+	HnswPQCentroidState *state = HNSW_PQ_ELEMENT_COMPRESSION_STATE(buildstate->pqState);
-+	TrainPQCentroids(index, samples, state, buildstate);
++	HnswPQState	   *pqstate = (HnswPQState *) buildstate->pqState;
++	HnswOPQCentroidState   *opqstate;
++	int				dim = buildstate->dimensions;
++	int				subvectorDim = HNSW_ELEMENT_PQ_SUBVECTOR_DIM;
++
++	/* Initialize OPQ state */
++	opqstate = InitOPQState(dim, subvectorDim);
++	pqstate->elementCompressionState = opqstate;
++
++	/* Train OPQ on original samples */
++	TrainOPQCore(index, samples, opqstate, buildstate, "OPQ");
 +}
 +
 +/* Initialize Element PQ centroids */
@@ -1540,26 +1984,21 @@ index 0000000..3f5f799
 +InitElementPQCentroids(Relation index, HnswBuildState * buildstate)
 +{
 +	VectorArray		samples = (VectorArray) buildstate->samples;
-+	HnswPQState	   *pqstate = (HnswPQState *) buildstate->pqState;
-+	HnswPQCentroidState	   *cstate;
 +
-+	cstate = InitCentroidState();
-+	pqstate->elementCompressionState = cstate;
-+
-+	/* Element PQ parameters: fixed subvector size with variable m */
-+	cstate->subvectorDim = HNSW_ELEMENT_PQ_SUBVECTOR_DIM;
-+	cstate->m = (buildstate->dimensions + HNSW_ELEMENT_PQ_SUBVECTOR_DIM - 1) / HNSW_ELEMENT_PQ_SUBVECTOR_DIM;
-+
-+	/* Train PQ centroids using pre-initialized samples */
++	/*
++	 * Element compression always uses OPQ for better compression quality.
++	 * When neighbor_metadata is enabled, OPQ is trained on residuals.
++	 * When neighbor_metadata is disabled, OPQ is trained on original vectors.
++	 */
 +	if (buildstate->hasNeighborMetadata)
 +	{
-+		/* Residual PQ approach: Train on the difference between original vectors and PQ-approximated vectors */
-+		TrainElementPQFromResiduals(index, samples, buildstate);
++		/* Residual OPQ approach: Train OPQ on the residuals */
++		TrainElementOPQFromResiduals(index, samples, buildstate);
 +	}
 +	else
 +	{
-+		/* Direct PQ approach: train directly on original vectors */
-+		TrainElementPQDirectly(index, samples, buildstate);
++		/* OPQ approach: train rotation matrix and codebook jointly */
++		TrainElementOPQ(index, samples, buildstate);
 +	}
 +}
 +
@@ -1597,11 +2036,54 @@ index 0000000..3f5f799
 +static void
 +FreePQState(HnswPQCentroidState * pqstate)
 +{
++	if (pqstate == NULL)
++		return;
++
 +	for (int i = 0; i < pqstate->m; i++)
 +		VectorArrayFree(pqstate->centroids[i]);
++	if (pqstate->centroids)
++		pfree(pqstate->centroids);
++	if (pqstate->subvectorBuffer)
++		pfree(pqstate->subvectorBuffer);
 +
-+	if (pqstate)
-+		pfree(pqstate);
++	pfree(pqstate);
++}
++
++/*
++ * Free OPQ state (rotation matrix and centroids)
++ */
++static void
++FreeOPQState(HnswOPQCentroidState *opqState)
++{
++	if (opqState == NULL)
++		return;
++
++	/* Free PQ state */
++	if (opqState->pq != NULL)
++	{
++		for (int i = 0; i < opqState->pq->m; i++)
++			VectorArrayFree(opqState->pq->centroids[i]);
++
++		if (opqState->pq->centroids)
++			pfree(opqState->pq->centroids);
++
++		if (opqState->pq->subvectorBuffer)
++			pfree(opqState->pq->subvectorBuffer);
++
++		pfree(opqState->pq);
++	}
++
++	/* Free OPQ-specific members */
++	if (opqState->r)
++		pfree(opqState->r);
++	if (opqState->encodeBuffer)
++		pfree(opqState->encodeBuffer);
++	if (opqState->decodeBuffer)
++		pfree(opqState->decodeBuffer);
++	if (opqState->residualBuffer)
++		pfree(opqState->residualBuffer);
++
++	pfree(opqState);
 +}
 +
 +/*
@@ -1619,7 +2101,7 @@ index 0000000..3f5f799
 +		FreePQState(pqstate->neighborMetadataState);
 +
 +	if (pqstate->elementCompressionState)
-+		FreePQState(pqstate->elementCompressionState);
++		FreeOPQState(pqstate->elementCompressionState);
 +}
 +
 +static bool
@@ -1787,23 +2269,49 @@ index 0000000..3f5f799
 +}
 +
 +/*
++ * Estimate size for OPQ state
++ */
++static Size
++EstimateOPQStateSize(HnswOPQCentroidState *opqState)
++{
++	Size size = 0;
++
++	if (opqState == NULL)
++		return 0;
++
++	/* Add OPQ state header size */
++	size = add_size(size, BUFFERALIGN(sizeof(HnswSharedOPQState)));
++
++	/* Add rotation matrix size */
++	size = add_size(size, opqState->pq->dim * opqState->pq->dim * sizeof(float));
++
++	/* Add PQ state size (reuse EstimatePQStateSize for centroids) */
++	size = add_size(size, EstimatePQStateSize(opqState->pq));
++
++	return size;
++}
++
++/*
 + * Estimate size of PQ state for shared memory
 + */
 +Size
 +HnswEstimateSharedPQState(HnswBuildState * buildstate)
 +{
-+	HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(buildstate->pqState);
-+	HnswPQCentroidState *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(buildstate->pqState);
++	HnswPQState *pqstate = (HnswPQState *) buildstate->pqState;
++	HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate);
++	HnswOPQCentroidState *opqstate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
 +	Size size = 0;
 +
-+	if ((nstate != NULL || estate != NULL))
++	if (nstate != NULL || opqstate != NULL)
 +	{
 +		/* Add header size */
 +		size = add_size(size, BUFFERALIGN(sizeof(HnswSharedPQInfo)));
 +
-+		/* Add neighbor metadata and element compression state size */
++		/* Add neighbor metadata state size */
 +		size = add_size(size, EstimatePQStateSize(nstate));
-+		size = add_size(size, EstimatePQStateSize(estate));
++
++		/* Add element compression state (OPQ) size */
++		size = add_size(size, EstimateOPQStateSize(opqstate));
 +	}
 +
 +	return size;
@@ -1844,13 +2352,45 @@ index 0000000..3f5f799
 +}
 +
 +/*
++ * Copy OPQ state to shared memory area
++ */
++static Size
++CopyOPQStateToShm(char *destArea, HnswOPQCentroidState *opqState)
++{
++	HnswSharedOPQState *sharedOPQState;
++	Size rotationSize;
++	Size pqStateSize;
++
++	if (opqState == NULL)
++		return 0;
++
++	/* Build OPQ state header */
++	sharedOPQState = (HnswSharedOPQState *) destArea;
++	sharedOPQState->dim = opqState->pq->dim;
++
++	/* Calculate rotation matrix size */
++	rotationSize = opqState->pq->dim * opqState->pq->dim * sizeof(float);
++	sharedOPQState->rotationMatrixSize = rotationSize;
++	sharedOPQState->pqStateOffset = rotationSize;
++
++	/* Copy rotation matrix */
++	memcpy(sharedOPQState->data, opqState->r, rotationSize);
++
++	/* Copy PQ state (centroids) using CopyCentroidStateToShm */
++	pqStateSize = CopyCentroidStateToShm(sharedOPQState->data + rotationSize, opqState->pq);
++
++	return BUFFERALIGN(sizeof(HnswSharedOPQState)) + rotationSize + pqStateSize;
++}
++
++/*
 + * Copy PQ state to shared memory
 + */
 +char *
 +HnswCopyPQStateToShm(ParallelContext * pcxt, HnswBuildState * buildstate, Size estpq)
 +{
-+	HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(buildstate->pqState);
-+	HnswPQCentroidState *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(buildstate->pqState);
++	HnswPQState *pqstate = (HnswPQState *) buildstate->pqState;
++	HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate);
++	HnswOPQCentroidState *opqstate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
 +	HnswSharedPQInfo *sharedpqinfo;
 +	char   *shared;
 +	char   *currentArea;
@@ -1878,11 +2418,11 @@ index 0000000..3f5f799
 +		sharedpqinfo->neighborMetadataOffset = 0;
 +	}
 +
-+	/* Copy element compression state if exists */
-+	if (estate != NULL)
++	/* Copy element compression state (OPQ) if exists */
++	if (opqstate != NULL)
 +	{
 +		sharedpqinfo->elementCompressionOffset = currentOffset;
-+		CopyCentroidStateToShm(currentArea, estate);
++		CopyOPQStateToShm(currentArea, opqstate);
 +	}
 +	else
 +	{
@@ -1910,6 +2450,7 @@ index 0000000..3f5f799
 +	pqState->m = sharedPQState->m;
 +	pqState->subvectorDim = sharedPQState->subvectorDim;
 +	pqState->centroids = palloc(sizeof(VectorArray) * pqState->m);
++	pqState->subvectorBuffer = InitVector(pqState->subvectorDim);
 +
 +	/* Restore centroids from shared memory */
 +	centroidsArea = (char *) sharedPQState + sharedPQState->centroidsOffset;
@@ -1929,6 +2470,49 @@ index 0000000..3f5f799
 +	}
 +
 +	return pqState;
++}
++
++/*
++ * Load OPQ state from shared memory
++ */
++static HnswOPQCentroidState *
++LoadOPQStateFromShm(HnswSharedOPQState *sharedOpqState, const HnswTypeInfo *typeInfo)
++{
++	HnswOPQCentroidState   *opqState;
++	HnswSharedPQState	   *sharedPQState;
++	HnswPQCentroidState	   *pqState;
++	Size	rotationSize;
++	int 	dim;
++
++	if (sharedOpqState == NULL)
++		return NULL;
++
++	dim = sharedOpqState->dim;
++
++	/* Allocate local OPQ state */
++	opqState = palloc(sizeof(HnswOPQCentroidState));
++
++	/* Restore rotation matrix */
++	rotationSize = dim * dim * sizeof(float);
++	opqState->r = palloc(rotationSize);
++	memcpy(opqState->r, sharedOpqState->data, rotationSize);
++
++	/* Allocate working buffers for encode/decode */
++	opqState->encodeBuffer = (float *) palloc(dim * sizeof(float));
++	opqState->decodeBuffer = (float *) palloc(dim * sizeof(float));
++
++	/* Allocate working buffer for residual OPQ */
++	opqState->residualBuffer = InitVector(dim);
++
++	/* Load PQ state (centroids) using LoadCentroidStateFromShm */
++	sharedPQState = (HnswSharedPQState *) (sharedOpqState->data + sharedOpqState->pqStateOffset);
++	pqState = LoadCentroidStateFromShm(sharedPQState, typeInfo);
++
++	/* Assign PQ state pointer and set dim */
++	opqState->pq = pqState;
++	opqState->pq->dim = dim;
++
++	return opqState;
 +}
 +
 +/*
@@ -1952,12 +2536,73 @@ index 0000000..3f5f799
 +		pqstate->neighborMetadataState = LoadCentroidStateFromShm(sharednstate, buildstate->typeInfo);
 +	}
 +
-+	/* Load element compression state if exists */
++	/* Load element compression state (OPQ) if exists */
 +	if (sharedpqinfo->elementCompressionOffset > 0)
 +	{
-+		HnswSharedPQState *sharedestate = (HnswSharedPQState *) (shared + sharedpqinfo->elementCompressionOffset);
-+		pqstate->elementCompressionState = LoadCentroidStateFromShm(sharedestate, buildstate->typeInfo);
++		HnswSharedOPQState *sharedopq = (HnswSharedOPQState *) (shared + sharedpqinfo->elementCompressionOffset);
++		pqstate->elementCompressionState = LoadOPQStateFromShm(sharedopq, buildstate->typeInfo);
 +	}
++}
++
++/*
++ * Create pages for OPQ rotation matrix only
++ */
++static BlockNumber
++HnswCreateOPQRotationPages(HnswBuildState * buildstate, HnswOPQCentroidState * opqState, uint16 *pageCount)
++{
++	Relation	index = buildstate->index;
++	ForkNumber	forkNum = buildstate->forkNum;
++	Buffer		buf;
++	Page		page;
++	BlockNumber startBlkno;
++	uint16		pagesUsed = 0;
++	int			dim = opqState->pq->dim;
++	Size		rotationSize = dim * dim * sizeof(float);
++	Size		offset = 0;
++	char	   *rotationData = (char *) opqState->r;
++
++	/* Create first page */
++	buf = HnswNewBuffer(index, forkNum);
++	page = BufferGetPage(buf);
++	HnswInitPage(buf, page);
++	startBlkno = BufferGetBlockNumber(buf);
++	pagesUsed = 1;
++
++	/* Write rotation matrix data across pages */
++	while (offset < rotationSize)
++	{
++		Size freeSpace = PageGetFreeSpace(page);
++		Size chunkSize = Min(rotationSize - offset, freeSpace - sizeof(ItemIdData));
++
++		if (chunkSize > 0)
++		{
++			if (PageAddItem(page, (Item) (rotationData + offset), chunkSize,
++							InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
++				elog(ERROR, "failed to add OPQ rotation data to \"%s\"", RelationGetRelationName(index));
++			offset += chunkSize;
++		}
++
++		if (offset < rotationSize)
++		{
++			/* Commit current page */
++			MarkBufferDirty(buf);
++			UnlockReleaseBuffer(buf);
++
++			/* Create new page */
++			buf = HnswNewBuffer(index, forkNum);
++			page = BufferGetPage(buf);
++			HnswInitPage(buf, page);
++			pagesUsed++;
++		}
++	}
++
++	/* Commit last page */
++	MarkBufferDirty(buf);
++	UnlockReleaseBuffer(buf);
++
++	*pageCount = pagesUsed;
++
++	return startBlkno;
 +}
 +
 +/*
@@ -2037,22 +2682,25 @@ index 0000000..3f5f799
 +HnswCreatePQPages(HnswBuildState * buildstate, HnswPQPages * pqpages)
 +{
 +	HnswPQState *pqstate = (HnswPQState *) buildstate->pqState;
-+	HnswPQCodebookPageData *nc;
-+	HnswPQCodebookPageData *ec;
++	HnswPQCodebookPageData  *nc;
++	HnswPQCodebookPageData  *ec;
++	HnswOPQRotationPageData *er;
 +
 +	if (pqstate == NULL)
 +		return 0;
 +
 +	nc = &pqpages->nCodebookPages;
 +	ec = &pqpages->eCodebookPages;
++	er = &pqpages->eRotationPages;
 +
-+	pqpages->hasPqState = pqstate->neighborMetadataState != NULL || pqstate->elementCompressionState != NULL;
++	pqpages->hasPqState = pqstate->neighborMetadataState != NULL ||
++						  pqstate->elementCompressionState != NULL;
 +
 +	if (pqstate->neighborMetadataState != NULL)
 +	{
++		/* Create centroid pages and record start page number */
 +		HnswPQCentroidState    *cstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate);
 +
-+		/* Create centroid pages and record start page number */
 +		nc->startBlkno = HnswCreateCodebookPages(buildstate, cstate, &nc->pageCount);
 +		nc->subvectorDim = cstate->subvectorDim;
 +		nc->m = cstate->m;
@@ -2067,22 +2715,28 @@ index 0000000..3f5f799
 +
 +	if (pqstate->elementCompressionState != NULL)
 +	{
-+		HnswPQCentroidState    *cstate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
++		/* Create OPQ rotation matrix pages and codebook pages for element compression */
++		HnswOPQCentroidState *opqState = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
 +
-+		/* Create centroid pages and record start page number */
-+		ec->startBlkno = HnswCreateCodebookPages(buildstate, cstate, &ec->pageCount);
-+		ec->subvectorDim = cstate->subvectorDim;
-+		ec->m = cstate->m;
++		/* Create rotation matrix pages */
++		er->startBlkno = HnswCreateOPQRotationPages(buildstate, opqState, &er->pageCount);
++
++		/* Create codebook pages (same format as neighbor metadata) */
++		ec->startBlkno = HnswCreateCodebookPages(buildstate, opqState->pq, &ec->pageCount);
++		ec->subvectorDim = opqState->pq->subvectorDim;
++		ec->m = opqState->pq->m;
 +	}
 +	else
 +	{
-+		ec->subvectorDim = 0;
-+		ec->m = 0;
 +		ec->startBlkno = InvalidBlockNumber;
 +		ec->pageCount = 0;
++		ec->subvectorDim = 0;
++		ec->m = 0;
++		er->startBlkno = InvalidBlockNumber;
++		er->pageCount = 0;
 +	}
 +
-+	return nc->pageCount + ec->pageCount;
++	return nc->pageCount + ec->pageCount + er->pageCount;
 +}
 +
 +/*
@@ -2097,6 +2751,7 @@ index 0000000..3f5f799
 +	HnswPQPages		pqpages;
 +	HnswPQState	   *pqstate;
 +	const HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
++	int				dimensions;
 +
 +	/* Read metapage */
 +	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
@@ -2106,6 +2761,7 @@ index 0000000..3f5f799
 +
 +	/* Since PQ pages are immutable, copy to local variable */
 +	pqpages = metap->pqPages;
++	dimensions = metap->dimensions;
 +
 +	UnlockReleaseBuffer(buf);
 +
@@ -2124,6 +2780,7 @@ index 0000000..3f5f799
 +		nstate->subvectorDim = pqpages.nCodebookPages.subvectorDim;
 +		nstate->m = pqpages.nCodebookPages.m;
 +		nstate->centroids = palloc0(sizeof(VectorArray) * nstate->m);
++		nstate->subvectorBuffer = InitVector(nstate->subvectorDim);
 +
 +		/* Initialize centroid arrays for each subvector */
 +		for (int m = 0; m < nstate->m; m++)
@@ -2138,39 +2795,93 @@ index 0000000..3f5f799
 +		pqstate->neighborMetadataState = nstate;
 +	}
 +
-+	/* Load element compression state if exists */
++	/* Load element compression state (OPQ) if exists */
 +	if (pqpages.eCodebookPages.pageCount > 0)
 +	{
-+		HnswPQCentroidState *estate;
++		HnswOPQCentroidState *opqState;
++		int dim = dimensions;
++		int m = pqpages.eCodebookPages.m;
++		int subvectorDim = pqpages.eCodebookPages.subvectorDim;
++		Size rotationSize = dim * dim * sizeof(float);
++		Size offset = 0;
++		Buffer opqBuf;
++		Page opqPage;
++		BlockNumber blkno = pqpages.eRotationPages.startBlkno;
++		int numItems;
++		int itemIndex = 0;
 +
-+		estate = InitCentroidState();
-+		estate->subvectorDim = pqpages.eCodebookPages.subvectorDim;
-+		estate->m = pqpages.eCodebookPages.m;
-+		estate->centroids = palloc0(sizeof(VectorArray) * estate->m);
++		opqState = palloc(sizeof(HnswOPQCentroidState));
++		opqState->pq = palloc(sizeof(HnswPQCentroidState));
++		opqState->pq->dim = dim;
++		opqState->pq->m = m;
++		opqState->pq->subvectorDim = subvectorDim;
++		opqState->r = palloc(rotationSize);
++		opqState->encodeBuffer = (float *) palloc(dim * sizeof(float));
++		opqState->decodeBuffer = (float *) palloc(dim * sizeof(float));
++		opqState->residualBuffer = InitVector(dim);
++		opqState->pq->subvectorBuffer = InitVector(subvectorDim);
++		opqState->pq->centroids = palloc(sizeof(VectorArray) * m);
 +
-+		/* Initialize centroid arrays for each subvector */
-+		for (int m = 0; m < estate->m; m++)
++		/* Initialize centroid arrays (same format as neighbor metadata) */
++		for (int i = 0; i < m; i++)
 +		{
-+			Size	itemsize = typeInfo->itemSize(estate->subvectorDim);
-+			estate->centroids[m] = VectorArrayInit(HNSW_PQ_NUM_CENTROIDS, estate->subvectorDim, itemsize);
++			Size	itemsize = typeInfo->itemSize(subvectorDim);
++			opqState->pq->centroids[i] = VectorArrayInit(HNSW_PQ_NUM_CENTROIDS, subvectorDim, itemsize);
 +		}
 +
-+		/* Load centroid data from pages */
-+		LoadCentroidsFromPages(index, pqpages.eCodebookPages.startBlkno, pqpages.eCodebookPages.pageCount, estate);
++		/* Read rotation matrix pages */
++		opqBuf = ReadBuffer(index, blkno);
++		LockBuffer(opqBuf, BUFFER_LOCK_SHARE);
++		opqPage = BufferGetPage(opqBuf);
++		numItems = PageGetMaxOffsetNumber(opqPage);
++		itemIndex = 1;
 +
-+		pqstate->elementCompressionState = estate;
++		/* Restore rotation matrix */
++		while (offset < rotationSize)
++		{
++			ItemId	itemId;
++			Size	chunkSize;
++			char   *data;
++
++			if (itemIndex > numItems)
++			{
++				/* Move to next page */
++				UnlockReleaseBuffer(opqBuf);
++				blkno++;
++				opqBuf = ReadBuffer(index, blkno);
++				LockBuffer(opqBuf, BUFFER_LOCK_SHARE);
++				opqPage = BufferGetPage(opqBuf);
++				numItems = PageGetMaxOffsetNumber(opqPage);
++				itemIndex = 1;
++			}
++
++			itemId = PageGetItemId(opqPage, itemIndex);
++			chunkSize = ItemIdGetLength(itemId);
++			data = (char *) PageGetItem(opqPage, itemId);
++
++			memcpy((char *) opqState->r + offset, data, chunkSize);
++			offset += chunkSize;
++			itemIndex++;
++		}
++
++		UnlockReleaseBuffer(opqBuf);
++
++		/* Load OPQ centroids using LoadCentroidsFromPages */
++		LoadCentroidsFromPages(index, pqpages.eCodebookPages.startBlkno, pqpages.eCodebookPages.pageCount, opqState->pq);
++
++		pqstate->elementCompressionState = opqState;
 +	}
 +
 +	return pqstate;
 +}
 +
 +/*
-+ * Compress element data using PQ compression
++ * Compress element data using OPQ compression
 + */
 +void
 +HnswCompressAndCopyElementData(char *dst, Datum v, HnswSupport * support, HnswPQState * pqstate)
 +{
-+	HnswPQCentroidState *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
++	HnswOPQCentroidState *opqstate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
 +	Vector *vec = DatumGetVector(v);
 +
 +	/* This function is only used when elements need to be compressed */
@@ -2178,30 +2889,31 @@ index 0000000..3f5f799
 +
 +	if (HNSW_PQ_NEIGHBOR_METADATA_EXISTS(pqstate))
 +	{
-+		/* Residual PQ approach: Train on the difference between original vectors and PQ-approximated vectors */
++		/*
++		 * Residual OPQ approach: compress the residual (original - PQ approximation)
++		 * using OPQ for better reconstruction quality.
++		 */
 +		HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate);
-+		Vector *tv = InitVector(vec->dim);
-+		Vector *rv = InitVector(vec->dim);
++		Vector *rv = opqstate->residualBuffer;
 +		uint8	encoded[HNSW_NEIGHBOR_METADATA_BYTES];
++
++		Assert(rv != NULL);
 +
 +		/* Step 1: Compress original vector with neighbor PQ */
 +		HnswPQEncodeVector(encoded, PointerGetDatum(vec), nstate, support, HNSW_NEIGHBOR_METADATA_BYTES);
 +
-+		/* Step 2: Reconstruct and compute residual */
-+		HnswPQDecodeVector(PointerGetDatum(tv), encoded, nstate, vec->dim);
++		/* Step 2: Reconstruct to rv, then compute residual in place */
++		HnswPQDecodeVector(PointerGetDatum(rv), encoded, nstate, vec->dim);
 +		for (int i = 0; i < vec->dim; i++)
-+			rv->x[i] = vec->x[i] - tv->x[i];
++			rv->x[i] = vec->x[i] - rv->x[i];
 +
-+		/* Step 3: Compress residual with element PQ */
-+		HnswPQEncodeVector((uint8 *) dst, PointerGetDatum(rv), estate, support, estate->m);
-+
-+		pfree(tv);
-+		pfree(rv);
++		/* Step 3: Compress residual with OPQ */
++		OPQEncodeVector((uint8 *) dst, rv, opqstate, support);
 +	}
 +	else
 +	{
-+		/* Direct PQ approach: compress original vector with element PQ */
-+		HnswPQEncodeVector((uint8 *) dst, PointerGetDatum(vec), estate, support, estate->m);
++		/* OPQ approach: rotate then PQ encode */
++		OPQEncodeVector((uint8 *) dst, vec, opqstate, support);
 +	}
 +}
 +
@@ -2213,6 +2925,7 @@ index 0000000..3f5f799
 +{
 +	Vector	   *result;
 +	int			dimensions;
++	HnswOPQCentroidState *opqstate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
 +
 +	/* Initialize result vector */
 +	dimensions = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
@@ -2221,30 +2934,29 @@ index 0000000..3f5f799
 +	/* Check compression type and reconstruct accordingly */
 +	if (pqstate->neighborMetadataState != NULL)
 +	{
-+		/* Residual PQ approach (neighbor_metadata=on) */
-+		Vector		*tv = InitVector(dimensions);
-+		Vector		*rv = InitVector(dimensions);
++		/* Residual OPQ approach (neighbor_metadata=on) */
++		Vector		*rv = opqstate->residualBuffer;
 +		HnswPQCentroidState *nstate = HNSW_PQ_NEIGHBOR_METADATA_STATE(pqstate);
-+		HnswPQCentroidState *estate = HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate);
 +
-+		/* Get neighbor PQ codes from neighbor entry metadata */
-+		HnswPQDecodeVector(PointerGetDatum(tv), (uint8 *) neighborMetadata, nstate, dimensions);
++		Assert(rv != NULL);
 +
-+		/* Reconstruct residual vector from element PQ codes */
-+		HnswPQDecodeVector(PointerGetDatum(rv), (uint8 *) etup->data, estate, dimensions);
++		/* Decode neighbor PQ to result, decode residual OPQ to rv */
++		HnswPQDecodeVector(PointerGetDatum(result), (uint8 *) neighborMetadata, nstate, dimensions);
++		OPQDecodeVector(rv, (uint8 *) etup->data, opqstate);
 +
 +		/* Combine: result = neighborReconstructed + residualReconstructed */
 +		for (int i = 0; i < dimensions; i++)
-+			result->x[i] = tv->x[i] + rv->x[i];
-+
-+		pfree(tv);
-+		pfree(rv);
++			result->x[i] += rv->x[i];
++	}
++	else if (opqstate != NULL)
++	{
++		/* OPQ approach (neighbor_metadata=off): PQ decode then inverse rotate */
++		OPQDecodeVector(result, (uint8 *) etup->data, opqstate);
 +	}
 +	else
 +	{
-+		/* Direct PQ approach (neighbor_metadata=off) */
-+		HnswPQCentroidState *estate = pqstate->elementCompressionState;
-+		HnswPQDecodeVector(PointerGetDatum(result), (uint8 *) etup->data, estate, dimensions);
++		/* No compression state available - this shouldn't happen */
++		elog(ERROR, "No element compression state found for decompression");
 +	}
 +
 +	return PointerGetDatum(result);
@@ -2300,10 +3012,10 @@ index 0000000..3f5f799
 \ No newline at end of file
 diff --git a/src/hnswpq.h b/src/hnswpq.h
 new file mode 100644
-index 0000000..bcbb870
+index 0000000..a54bfb2
 --- /dev/null
 +++ b/src/hnswpq.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,134 @@
 +#ifndef HNSW_SIMHASH_H
 +#define HNSW_SIMHASH_H
 +
@@ -2348,31 +3060,60 @@ index 0000000..bcbb870
 +/* As post-processing of HNSW search, recheck data points whose distance to query q has been estimated */
 +#define HNSW_SCAN_ESTIMATED_DISTANCE_QUEUE
 +
-+/* Generic PQ (Product Quantization) state */
++/* Generic PQ (Product Quantization) state for neighbor metadata */
 +typedef struct HnswPQCentroidState {
-+	int				subvectorDim;	/* Dimension of each sub-vector */
++	int				dim;			/* Original vector dimension (used by OPQ, 0 for basic PQ) */
 +	int				m;				/* Number of sub-vectors */
++	int				subvectorDim;	/* Dimension of each sub-vector */
 +	VectorArray    *centroids;		/* Centroids for each sub-vector, the number of centroids per sub-vector is HNSW_PQ_NUM_CENTROIDS */
++
++	/* Working buffer for subvector (subvectorDim floats) */
++	Vector		   *subvectorBuffer;
 +}			HnswPQCentroidState;
 +
++/*
++ * OPQ (Optimized Product Quantization) state for element compression
++ * This structure extends HnswPQCentroidState with a rotation matrix.
++ * Element compression always uses OPQ to improve compression quality.
++ */
++typedef struct HnswOPQCentroidState {
++	HnswPQCentroidState	*pq;		/* Base PQ state (codebook in rotated space) */
++	float   *r;						/* Rotation matrix (dim x dim), row-major */
++
++	/* Working buffers for encode/decode (dim floats each) */
++	float   *encodeBuffer;
++	float   *decodeBuffer;
++	Vector  *residualBuffer;
++}			HnswOPQCentroidState;
++
 +typedef struct HnswPQState {
-+	HnswPQCentroidState *neighborMetadataState;
-+	HnswPQCentroidState *elementCompressionState;
++	HnswPQCentroidState	   *neighborMetadataState;		/* PQ state for neighbor metadata */
++	HnswOPQCentroidState   *elementCompressionState;	/* OPQ state for element compression (always uses OPQ) */
 +}			HnswPQState;
 +
++/* Shared memory state for PQ (neighbor metadata) */
 +typedef struct HnswSharedPQState
 +{
-+	int		subvectorDim;		/* Dimension of each sub-vector */
-+	int		m;					/* Number of subvectors */
-+	Size	centroidsOffset;	/* Offset to centroids data in shared memory */
-+	Size	centroidsSize;		/* Total size of centroids data */
++	int			subvectorDim;		/* Dimension of each sub-vector */
++	int			m;					/* Number of subvectors */
++	Size		centroidsOffset;	/* Offset to centroids data in shared memory */
++	Size		centroidsSize;		/* Total size of centroids data */
 +}			HnswSharedPQState;
++
++/* Shared memory state for OPQ (element compression) */
++typedef struct HnswSharedOPQState
++{
++	int			dim;							/* Original vector dimension */
++	Size		rotationMatrixSize;				/* Size of rotation matrix */
++	Size		pqStateOffset;					/* Offset to HnswSharedPQState (after rotation matrix) */
++	char		data[FLEXIBLE_ARRAY_MEMBER];	/* Rotation matrix followed by HnswSharedPQState */
++}			HnswSharedOPQState;
 +
 +typedef struct HnswSharedPQInfo
 +{
-+	Size	neighborMetadataOffset;		/* Offset to neighbor metadata in shared memory */
-+	Size	elementCompressionOffset;	/* Offset to element compression in shared memory */
-+	Size	totalSize;					/* Total size of all compression data */
++	Size		neighborMetadataOffset;			/* Offset to neighbor metadata in shared memory */
++	Size		elementCompressionOffset;		/* Offset to element OPQ compression in shared memory */
++	Size		totalSize;						/* Total size of all compression data */
 +}			HnswSharedPQInfo;
 +
 +typedef struct HnswCentroidTupleData
@@ -2411,7 +3152,7 @@ index 0000000..bcbb870
 +#endif
 \ No newline at end of file
 diff --git a/src/hnswscan.c b/src/hnswscan.c
-index 955998a..6bf9f1e 100644
+index 955998a..4c5ccc2 100644
 --- a/src/hnswscan.c
 +++ b/src/hnswscan.c
 @@ -2,6 +2,7 @@
@@ -2430,11 +3171,13 @@ index 955998a..6bf9f1e 100644
  	HnswSupport *support = &so->support;
  	List	   *ep;
  	List	   *w;
-@@ -23,9 +25,11 @@ GetScanItems(IndexScanDesc scan, Datum value)
+@@ -23,9 +25,13 @@ GetScanItems(IndexScanDesc scan, Datum value)
  	HnswElement entryPoint;
  	char	   *base = NULL;
  	HnswQuery  *q = &so->q;
 +	bool		residualCompressionEnabled = HNSW_PQ_RESIDUAL_COMPRESSION_ENABLED(so->pqState);
++	bool		candidatePruning = hnsw_candidate_pruning;
++	int			distanceComputationTopK = hnsw_distance_computation_topk;
 +	char		entryMetadata[HNSW_NEIGHBOR_METADATA_BYTES];
  
  	/* Get m and entry point */
@@ -2443,7 +3186,7 @@ index 955998a..6bf9f1e 100644
  
  	q->value = value;
  	so->m = m;
-@@ -33,15 +37,15 @@ GetScanItems(IndexScanDesc scan, Datum value)
+@@ -33,15 +39,15 @@ GetScanItems(IndexScanDesc scan, Datum value)
  	if (entryPoint == NULL)
  		return NIL;
  
@@ -2453,25 +3196,34 @@ index 955998a..6bf9f1e 100644
  	for (int lc = entryPoint->level; lc >= 1; lc--)
  	{
 -		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
-+		w = HnswSearchLayer(base, q, ep, 1, lc, index, typeInfo, support, m, false, NULL, NULL, NULL, true, NULL, so->pqState, true);
++		w = HnswSearchLayer(base, q, ep, 1, lc, index, typeInfo, support, m, false, NULL, NULL, NULL, true, NULL, so->pqState, candidatePruning, distanceComputationTopK);
  		ep = w;
  	}
  
 -	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
-+	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, typeInfo, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, so->pqState, true);
++	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, typeInfo, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, so->pqState, candidatePruning, distanceComputationTopK);
  }
  
  /*
-@@ -72,7 +76,7 @@ ResumeScanItems(IndexScanDesc scan)
+@@ -55,6 +61,8 @@ ResumeScanItems(IndexScanDesc scan)
+ 	List	   *ep = NIL;
+ 	char	   *base = NULL;
+ 	int			batch_size = hnsw_ef_search;
++	bool		candidatePruning = hnsw_candidate_pruning;
++	int			distanceComputationTopK = hnsw_distance_computation_topk;
+ 
+ 	if (pairingheap_is_empty(so->discarded))
+ 		return NIL;
+@@ -72,7 +80,7 @@ ResumeScanItems(IndexScanDesc scan)
  		ep = lappend(ep, sc);
  	}
  
 -	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
-+	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, so->typeInfo, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, so->pqState, true);
++	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, so->typeInfo, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, so->pqState, candidatePruning, distanceComputationTopK);
  }
  
  /*
-@@ -131,6 +135,9 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
+@@ -131,6 +139,9 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
  	/* Set support functions */
  	HnswInitSupport(&so->support, index);
  
@@ -2482,7 +3234,7 @@ index 955998a..6bf9f1e 100644
  	 * Use a lower max allocation size than default to allow scanning more
  	 * tuples for iterative search before exceeding work_mem
 diff --git a/src/hnswutils.c b/src/hnswutils.c
-index 7afed25..e927493 100644
+index 7afed25..f2def56 100644
 --- a/src/hnswutils.c
 +++ b/src/hnswutils.c
 @@ -1,5 +1,6 @@
@@ -2620,7 +3372,7 @@ index 7afed25..e927493 100644
 +HnswCalculateElementTupleSize(void * pqstate, Datum v)
 +{
 +	if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(pqstate))
-+		return HNSW_ELEMENT_TUPLE_PQ_COMPRESSED_SIZE(HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate)->m);
++		return HNSW_ELEMENT_TUPLE_PQ_COMPRESSED_SIZE(HNSW_PQ_ELEMENT_COMPRESSION_STATE(pqstate)->pq->m);
 +	else
 +		return HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(v));
 +}
@@ -3055,7 +3807,7 @@ index 7afed25..e927493 100644
   */
  List *
 -HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
-+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, void * pqstate, bool candidatePruning)
++HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, const HnswTypeInfo * typeInfo, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, void * pqstate, bool candidatePruning, int computeDistanceTopk)
  {
  	List	   *w = NIL;
  	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -3253,7 +4005,7 @@ index 7afed25..e927493 100644
  	for (int lc = entryLevel; lc >= level + 1; lc--)
  	{
 -		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
-+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, typeInfo, support, m, true, skipElement, NULL, NULL, true, NULL, pqstate, false);
++		w = HnswSearchLayer(base, &q, ep, 1, lc, index, typeInfo, support, m, true, skipElement, NULL, NULL, true, NULL, pqstate, false, 0);
  		ep = w;
  	}
  
@@ -3262,7 +4014,7 @@ index 7afed25..e927493 100644
  		ListCell   *lc2;
  
 -		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
-+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, typeInfo, support, m, true, skipElement, NULL, NULL, true, NULL, pqstate, false);
++		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, typeInfo, support, m, true, skipElement, NULL, NULL, true, NULL, pqstate, false, 0);
  
  		/* Convert search candidates to candidates */
  		foreach(lc2, w)
@@ -3373,7 +4125,7 @@ index 7afed25..e927493 100644
  
  	PG_RETURN_POINTER(&typeInfo);
 diff --git a/src/hnswvacuum.c b/src/hnswvacuum.c
-index 251d9d9..4bdbcc0 100644
+index 251d9d9..338d608 100644
 --- a/src/hnswvacuum.c
 +++ b/src/hnswvacuum.c
 @@ -3,11 +3,15 @@
@@ -3651,7 +4403,7 @@ index 251d9d9..4bdbcc0 100644
 -			MemSet(&etup->data, 0, VARSIZE_ANY(&etup->data));
 +
 +			if (HNSW_PQ_ELEMENT_COMPRESSION_ENABLED(vacuumstate->pqState))
-+				MemSet(&etup->data, 0, HNSW_PQ_ELEMENT_COMPRESSION_STATE(vacuumstate->pqState)->m);
++				MemSet(&etup->data, 0, HNSW_PQ_ELEMENT_COMPRESSION_STATE(vacuumstate->pqState)->pq->m);
 +			else
 +				MemSet(&etup->data, 0, VARSIZE_ANY(&etup->data));
  
