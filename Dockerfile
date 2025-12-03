@@ -57,6 +57,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
       build-essential \
+      liblapacke-dev \
       libpq-dev \
       postgresql-server-dev-"${PG_MAJOR}" \
       ca-certificates \

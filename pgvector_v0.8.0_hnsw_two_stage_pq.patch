@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 7a4b88c..fbe2f0c 100644
+index 7a4b88c..3c27046 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -4,7 +4,7 @@ EXTVERSION = 0.8.0
@@ -11,6 +11,24 @@ index 7a4b88c..fbe2f0c 100644
  HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
  
  TESTS = $(wildcard test/sql/*.sql)
+@@ -32,6 +32,17 @@ endif
+ # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
+ PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+ 
++# LAPACK support for OPQ SVD computation
++# On macOS, this uses Accelerate framework (no additional installation needed)
++# On Linux, install liblapacke-dev: apt-get install liblapacke-dev
++ifeq ($(shell uname -s), Darwin)
++# macOS: use Accelerate framework
++SHLIB_LINK += -framework Accelerate
++else
++# Linux: use LAPACKE
++SHLIB_LINK += -llapacke -llapack -lblas
++endif
++
+ # Debug GCC auto-vectorization
+ # PG_CFLAGS += -fopt-info-vec
+ 
 diff --git a/Makefile.win b/Makefile.win
 index 8c62f9d..698f5ea 100644
 --- a/Makefile.win
@@ -1028,10 +1046,10 @@ index a5fac4e..a4f9c47 100644
  	MemoryContextSwitchTo(oldCtx);
 diff --git a/src/hnswpq.c b/src/hnswpq.c
 new file mode 100644
-index 0000000..cba1ac8
+index 0000000..a206b48
 --- /dev/null
 +++ b/src/hnswpq.c
-@@ -0,0 +1,1977 @@
+@@ -0,0 +1,2131 @@
 +#include "postgres.h"
 +
 +#include <float.h>
@@ -1050,6 +1068,37 @@ index 0000000..cba1ac8
 +#include "utils/memutils.h"
 +#include "utils/rel.h"
 +#include "utils/syscache.h"
++
++/* For SVD and matrix operations using LAPACK/BLAS */
++#ifdef __APPLE__
++/*
++ * On macOS, use Accelerate framework's BLAS/LAPACK directly.
++ * We declare only the functions we need to avoid type conflicts with PostgreSQL headers.
++ */
++
++/* CBLAS enum definitions for matrix operations */
++typedef enum CBLAS_ORDER { CblasRowMajor = 101, CblasColMajor = 102 } CBLAS_ORDER;
++typedef enum CBLAS_TRANSPOSE { CblasNoTrans = 111, CblasTrans = 112, CblasConjTrans = 113 } CBLAS_TRANSPOSE;
++
++extern void cblas_sgemm(CBLAS_ORDER Order, CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
++						int M, int N, int K,
++						float alpha, const float *A, int lda,
++						const float *B, int ldb,
++						float beta, float *C, int ldc);
++
++extern void cblas_sgemv(CBLAS_ORDER Order, CBLAS_TRANSPOSE TransA,
++						int M, int N,
++						float alpha, const float *A, int lda,
++						const float *X, int incX,
++						float beta, float *Y, int incY);
++
++extern int sgesvd_(char *jobu, char *jobvt, int *m, int *n, float *a, int *lda,
++				   float *s, float *u, int *ldu, float *vt, int *ldvt,
++				   float *work, int *lwork, int *info);
++#else
++#include <lapacke.h>
++#include <cblas.h>
++#endif
 +
 +/*
 + * Get whether neighbor metadata is stored in the index
@@ -1114,37 +1163,41 @@ index 0000000..cba1ac8
 +/*
 + * Rotate a single vector: dst = src * R^T (for encoding)
 + * src and dst should have dimension 'dim'
++ * Using CBLAS: dst = R * src (equivalent to src * R^T for row vectors)
 + */
 +static void
 +RotateVector(float *dst, float *src, float *r, int dim)
 +{
-+	for (int i = 0; i < dim; i++)
-+	{
-+		float		sum = 0.0f;
-+
-+		for (int j = 0; j < dim; j++)
-+			sum += src[j] * r[i * dim + j];
-+
-+		dst[i] = sum;
-+	}
++	/*
++	 * For row-major R (dim x dim), computing dst = src * R^T
++	 * is equivalent to dst = R * src in matrix notation.
++	 * cblas_sgemv with CblasNoTrans computes: y = alpha * A * x + beta * y
++	 */
++	cblas_sgemv(CblasRowMajor, CblasNoTrans,
++				dim, dim,		/* M, N: R is dim x dim */
++				1.0f, r, dim,	/* alpha, A, lda */
++				src, 1,			/* X, incX */
++				0.0f, dst, 1);	/* beta, Y, incY */
 +}
 +
 +/*
 + * Inverse rotate a single vector: dst = src * R (for decoding)
 + * Since R is orthogonal, R^(-1) = R^T, so this computes src * R
++ * Using CBLAS: dst = R^T * src (equivalent to src * R for row vectors)
 + */
 +static void
 +InverseRotateVector(float *dst, float *src, float *r, int dim)
 +{
-+	for (int i = 0; i < dim; i++)
-+	{
-+		float		sum = 0.0f;
-+
-+		for (int j = 0; j < dim; j++)
-+			sum += src[j] * r[j * dim + i];
-+
-+		dst[i] = sum;
-+	}
++	/*
++	 * For row-major R (dim x dim), computing dst = src * R
++	 * is equivalent to dst = R^T * src in matrix notation.
++	 * cblas_sgemv with CblasTrans computes: y = alpha * A^T * x + beta * y
++	 */
++	cblas_sgemv(CblasRowMajor, CblasTrans,
++				dim, dim,		/* M, N: R is dim x dim */
++				1.0f, r, dim,	/* alpha, A, lda */
++				src, 1,			/* X, incX */
++				0.0f, dst, 1);	/* beta, Y, incY */
 +}
 +
 +/*
@@ -1296,112 +1349,176 @@ index 0000000..cba1ac8
 +}
 +
 +/*
-+ * Compute covariance matrix: cov = Y^T * X
-+ * X: n x dim matrix (original samples)
-+ * Y: n x dim matrix (reconstructed samples)
-+ * cov: dim x dim output matrix
++ * SVD workspace structure for reusing allocated memory across iterations
++ */
++typedef struct SvdState
++{
++	int		dim;		/* Dimension of the matrix */
++	int		lwork;		/* Size of LAPACK work array */
++	float  *sigma;		/* Singular values (dim) */
++	float  *a_copy;		/* Copy of input matrix, column-major (dim x dim) */
++	float  *u_col;		/* U matrix, column-major (dim x dim) */
++	float  *vt_col;		/* V^T matrix, column-major (dim x dim) */
++	float  *work;		/* LAPACK work array */
++}			SvdState;
++
++/*
++ * Call LAPACK sgesvd with platform-specific implementation.
++ * When lwork < 0, queries optimal workspace size and stores in work[0].
++ */
++static void
++ComputeSvdInternal(int dim, float *a, float *sigma, float *u, float *vt, float *work, int lwork)
++{
++	int		info;
++
++#ifdef __APPLE__
++	{
++		char	jobu = 'A';
++		char	jobvt = 'A';
++		int		m = dim;
++		int		n = dim;
++		int		lda = dim;
++		int		ldu = dim;
++		int		ldvt = dim;
++
++		sgesvd_(&jobu, &jobvt, &m, &n, a, &lda,
++				sigma, u, &ldu, vt, &ldvt,
++				work, &lwork, &info);
++	}
++#else
++	info = LAPACKE_sgesvd_work(LAPACK_COL_MAJOR, 'A', 'A',
++							   dim, dim, a, dim,
++							   sigma, u, dim, vt, dim,
++							   work, lwork);
++#endif
++
++	if (lwork > 0 && info != 0)
++		elog(ERROR, "LAPACK sgesvd failed with info = %d", info);
++}
++
++/*
++ * Initialize SVD workspace for given dimension
++ */
++static SvdState *
++InitSvdState(int dim)
++{
++	SvdState   *ws = (SvdState *) palloc(sizeof(SvdState));
++	float		work_query;
++
++	ws->dim = dim;
++	ws->sigma = (float *) palloc(dim * sizeof(float));
++	ws->a_copy = (float *) palloc(dim * dim * sizeof(float));
++	ws->u_col = (float *) palloc(dim * dim * sizeof(float));
++	ws->vt_col = (float *) palloc(dim * dim * sizeof(float));
++
++	/* Query optimal workspace size with lwork = -1 */
++	ComputeSvdInternal(dim, ws->a_copy, ws->sigma, ws->u_col, ws->vt_col, &work_query, -1);
++	ws->lwork = (int) work_query;
++
++	ws->work = (float *) palloc(ws->lwork * sizeof(float));
++
++	return ws;
++}
++
++/*
++ * Free SVD workspace
++ */
++static void
++FreeSvdState(SvdState *ws)
++{
++	if (ws == NULL)
++		return;
++
++	pfree(ws->work);
++	pfree(ws->vt_col);
++	pfree(ws->u_col);
++	pfree(ws->a_copy);
++	pfree(ws->sigma);
++	pfree(ws);
++}
++
++/*
++ * Compute covariance matrix: cov = Y^T * X using BLAS sgemm
 + */
 +static void
 +ComputeCovariance(float *xData, float *yData, int n, int dim, float *cov)
 +{
-+	/* Initialize cov to zero */
-+	memset(cov, 0, dim * dim * sizeof(float));
++	/*
++	 * cblas_sgemm computes: C = alpha * op(A) * op(B) + beta * C
++	 */
++	cblas_sgemm(CblasRowMajor,
++				CblasTrans,		/* op(A) = A^T */
++				CblasNoTrans,	/* op(B) = B */
++				dim,			/* M: rows of op(A) and C */
++				dim,			/* N: columns of op(B) and C */
++				n,				/* K: columns of op(A) / rows of op(B) */
++				1.0f,			/* alpha */
++				yData,			/* A: n x dim matrix */
++				dim,			/* lda: leading dimension of A */
++				xData,			/* B: n x dim matrix */
++				dim,			/* ldb: leading dimension of B */
++				0.0f,			/* beta */
++				cov,			/* C: dim x dim output matrix */
++				dim);			/* ldc: leading dimension of C */
++}
 +
-+	/* Compute cov = Y^T * X using simple triple loop (BLAS-independent) */
++/*
++ * Compute SVD of a square matrix using pre-allocated workspace.
++ * A = U * Sigma * V^T
++ */
++static void
++ComputeSvd(float *cov, int dim, float *u, float *v, SvdState *ws)
++{
++	Assert(ws->dim == dim);
++
++	/* Convert row-major to column-major for LAPACK */
 +	for (int i = 0; i < dim; i++)
 +	{
 +		for (int j = 0; j < dim; j++)
-+		{
-+			float		sum = 0.0f;
++			ws->a_copy[j * dim + i] = cov[i * dim + j];
++	}
 +
-+			for (int k = 0; k < n; k++)
-+				sum += yData[k * dim + i] * xData[k * dim + j];
++	/* Compute SVD using LAPACK */
++	ComputeSvdInternal(dim, ws->a_copy, ws->sigma, ws->u_col, ws->vt_col, ws->work, ws->lwork);
 +
-+			cov[i * dim + j] = sum;
-+		}
++	/* Convert U from column-major to row-major */
++	for (int i = 0; i < dim; i++)
++	{
++		for (int j = 0; j < dim; j++)
++			u[i * dim + j] = ws->u_col[j * dim + i];
++	}
++
++	/* Convert V^T (column-major) to V (row-major): V = (V^T)^T */
++	for (int i = 0; i < dim; i++)
++	{
++		for (int j = 0; j < dim; j++)
++			v[i * dim + j] = ws->vt_col[i * dim + j];
 +	}
 +}
 +
 +/*
-+ * Compute SVD using Jacobi rotation method
-+ * This is a simplified SVD implementation for Procrustes update (R = U * V^T)
-+ * The input matrix 'cov' is modified in place during computation.
-+ * u and v are pre-allocated dim x dim matrices for output.
++ * Compute matrix product: R = U * V^T using BLAS sgemm
 + */
 +static void
-+ComputeSvd(float *cov, int dim, float *u, float *v)
++ComputeMatrixProduct(float *u, float *v, int dim, float *r)
 +{
-+	const int	maxSweeps = 32;
-+	const float	eps = 1e-6f;
-+
-+	/* Initialize U and V as identity matrices */
-+	for (int i = 0; i < dim; i++)
-+	{
-+		for (int j = 0; j < dim; j++)
-+		{
-+			u[i * dim + j] = (i == j) ? 1.0f : 0.0f;
-+			v[i * dim + j] = (i == j) ? 1.0f : 0.0f;
-+		}
-+	}
-+
-+	/* Jacobi rotation sweeps until convergence */
-+	for (int sweep = 0; sweep < maxSweeps; sweep++)
-+	{
-+		float		offDiag = 0.0f;
-+
-+		for (int p = 0; p < dim; p++)
-+		{
-+			for (int q = p + 1; q < dim; q++)
-+			{
-+				float		app = cov[p * dim + p];
-+				float		aqq = cov[q * dim + q];
-+				float		apq = cov[p * dim + q];
-+				float		tau;
-+				float		t;
-+				float		c;
-+				float		s;
-+
-+				offDiag += fabsf(apq);
-+
-+				if (fabsf(apq) < eps)
-+					continue;
-+
-+				tau = (aqq - app) / (2.0f * apq);
-+				t = copysignf(1.0f / (fabsf(tau) + sqrtf(1.0f + tau * tau)), tau);
-+				c = 1.0f / sqrtf(1.0f + t * t);
-+				s = t * c;
-+
-+				/* Apply rotation to cov, U, and V */
-+				for (int k = 0; k < dim; k++)
-+				{
-+					float		cpk = cov[p * dim + k];
-+					float		cqk = cov[q * dim + k];
-+					float		kup;
-+					float		kuq;
-+					float		kvp;
-+					float		kvq;
-+
-+					cov[p * dim + k] = c * cpk - s * cqk;
-+					cov[q * dim + k] = s * cpk + c * cqk;
-+
-+					kup = u[k * dim + p];
-+					kuq = u[k * dim + q];
-+
-+					u[k * dim + p] = c * kup - s * kuq;
-+					u[k * dim + q] = s * kup + c * kuq;
-+
-+					kvp = v[k * dim + p];
-+					kvq = v[k * dim + q];
-+
-+					v[k * dim + p] = c * kvp - s * kvq;
-+					v[k * dim + q] = s * kvp + c * kvq;
-+				}
-+			}
-+		}
-+
-+		if (offDiag < eps)
-+			break;
-+	}
++	/*
++	 * cblas_sgemm computes: C = alpha * op(A) * op(B) + beta * C
++	 */
++	cblas_sgemm(CblasRowMajor,
++				CblasNoTrans,	/* op(A) = A */
++				CblasTrans,		/* op(B) = B^T */
++				dim,			/* M: rows of op(A) and C */
++				dim,			/* N: columns of op(B) and C */
++				dim,			/* K: columns of op(A) / rows of op(B) */
++				1.0f,			/* alpha */
++				u,				/* A: dim x dim matrix */
++				dim,			/* lda: leading dimension of A */
++				v,				/* B: dim x dim matrix */
++				dim,			/* ldb: leading dimension of B */
++				0.0f,			/* beta */
++				r,				/* C: dim x dim output matrix */
++				dim);			/* ldc: leading dimension of C */
 +}
 +
 +/*
@@ -1409,27 +1526,17 @@ index 0000000..cba1ac8
 + * Requires pre-allocated buffers: cov (dim x dim), u (dim x dim), v (dim x dim)
 + */
 +static void
-+ProcrustesUpdate(float *xData, float *yData, int n, int dim, float *r, float *cov, float *u, float *v)
++ProcrustesUpdate(float *xData, float *yData, int n, int dim, float *r,
++				 float *cov, float *u, float *v, SvdState *ws)
 +{
 +	/* Compute covariance: cov = Y^T * X */
 +	ComputeCovariance(xData, yData, n, dim, cov);
 +
 +	/* Compute SVD of cov */
-+	ComputeSvd(cov, dim, u, v);
++	ComputeSvd(cov, dim, u, v, ws);
 +
-+	/* Compute R = U * V^T */
-+	for (int i = 0; i < dim; i++)
-+	{
-+		for (int j = 0; j < dim; j++)
-+		{
-+			float		sum = 0.0f;
-+
-+			for (int k = 0; k < dim; k++)
-+				sum += u[i * dim + k] * v[j * dim + k];
-+
-+			r[i * dim + j] = sum;
-+		}
-+	}
++	/* Compute R = U * V^T using BLAS sgemm */
++	ComputeMatrixProduct(u, v, dim, r);
 +}
 +
 +/*
@@ -1771,6 +1878,84 @@ index 0000000..cba1ac8
 +}
 +
 +/*
++ * Free PQ centroids only (without freeing the pqstate structure itself)
++ */
++static void
++FreePQCentroids(HnswPQCentroidState *pqstate)
++{
++	if (pqstate == NULL || pqstate->centroids == NULL)
++		return;
++
++	for (int i = 0; i < pqstate->m; i++)
++	{
++		if (pqstate->centroids[i] != NULL)
++			VectorArrayFree(pqstate->centroids[i]);
++	}
++
++	pfree(pqstate->centroids);
++	pqstate->centroids = NULL;
++}
++
++/*
++ * Compute Mean Squared Error (MSE) between original and reconstructed vectors
++ * MSE = (1/n) * sum_i ||X_i - Y_i||^2
++ */
++static double
++ComputeMSE(VectorArray x, float *y, int dim)
++{
++	double		mse = 0.0;
++	int			n = x->length;
++
++	for (int i = 0; i < n; i++)
++	{
++		Vector *v = (Vector *) VectorArrayGet(x, i);
++
++		for (int d = 0; d < dim; d++)
++		{
++			float	diff = v->x[d] - y[i * dim + d];
++
++			mse += (double) diff * diff;
++		}
++	}
++
++	return mse / (double) n;
++}
++
++/*
++ * Format matrix contents for debugging.
++ * Shows only first 'maxRows' rows and 'maxCols' columns, with "..." for omitted parts.
++ * Returns a palloc'd string that must be freed by the caller.
++ */
++static char *
++FormatMatrix(const char *name, float *m, int dim, int maxRows, int maxCols)
++{
++	StringInfoData	buf;
++	int				showRows = Min(maxRows, dim);
++	int				showCols = Min(maxCols, dim);
++
++	initStringInfo(&buf);
++	appendStringInfo(&buf, "%s (%d x %d):\n", name, dim, dim);
++
++	for (int i = 0; i < showRows; i++)
++	{
++		appendStringInfo(&buf, "  [");
++		for (int j = 0; j < showCols; j++)
++		{
++			if (j > 0)
++				appendStringInfo(&buf, ", ");
++			appendStringInfo(&buf, "%8.4f", m[i * dim + j]);
++		}
++		if (showCols < dim)
++			appendStringInfo(&buf, ", ...");
++		appendStringInfo(&buf, "]\n");
++	}
++	if (showRows < dim)
++		appendStringInfo(&buf, "  ...");
++
++	return buf.data;
++}
++
++/*
 + * Core OPQ training loop using alternating optimization.
 + * This is the shared implementation for both TrainElementOPQ and TrainElementOPQFromResiduals.
 + */
@@ -1789,6 +1974,7 @@ index 0000000..cba1ac8
 +	float		   *cov;			/* Working buffer for Procrustes: covariance matrix */
 +	float		   *svdU;			/* Working buffer for Procrustes: SVD U matrix */
 +	float		   *svdV;			/* Working buffer for Procrustes: SVD V matrix */
++	SvdState	   *svdWs;			/* Pre-allocated SVD workspace */
 +	VectorArray		rotatedSamples;	/* Working buffer for rotated samples */
 +	Vector		   *decoded;		/* Working buffer for encode/decode */
 +
@@ -1799,6 +1985,7 @@ index 0000000..cba1ac8
 +	cov = (float *) palloc(dim * dim * sizeof(float));
 +	svdU = (float *) palloc(dim * dim * sizeof(float));
 +	svdV = (float *) palloc(dim * dim * sizeof(float));
++	svdWs = InitSvdState(dim);
 +	rotatedSamples = VectorArrayInit(n, dim, itemSize);
 +	rotatedSamples->length = n;
 +	decoded = InitVector(dim);
@@ -1828,51 +2015,37 @@ index 0000000..cba1ac8
 +	/* Alternating optimization loop */
 +	for (int iter = 0; iter < rotationIters; iter++)
 +	{
++		/* Log updated rotation matrix (show first 8 rows and 8 columns) */
++		elog(DEBUG1, "%s", FormatMatrix("R", opqstate->r, dim, 8, 8));
++
 +		/* Step 1: Rotate samples with current R */
 +		RotateSamples(rotatedSamples, opqstate->r, dim, tmpBuffer);
 +
 +		/* Step 2: Train PQ centroids in rotated space */
-+		{
-+			HnswPQCentroidState tmpState;
-+
-+			tmpState.m = opqstate->pq->m;
-+			tmpState.subvectorDim = subvectorDim;
-+			tmpState.centroids = NULL;
-+
-+			TrainPQCentroids(index, rotatedSamples, &tmpState, buildstate);
-+
-+			/* Free old centroids if exist */
-+			if (opqstate->pq->centroids != NULL)
-+			{
-+				for (int m = 0; m < opqstate->pq->m; m++)
-+				{
-+					if (opqstate->pq->centroids[m] != NULL)
-+						VectorArrayFree(opqstate->pq->centroids[m]);
-+				}
-+
-+				pfree(opqstate->pq->centroids);
-+				opqstate->pq->centroids = NULL;
-+			}
-+
-+			opqstate->pq->centroids = tmpState.centroids;
-+		}
++		FreePQCentroids(opqstate->pq);
++		TrainPQCentroids(index, rotatedSamples, opqstate->pq, buildstate);
 +
 +		/* Step 3: Encode and decode to get reconstructed vectors Y */
 +		for (int i = 0; i < n; i++)
 +		{
-+			Vector	   *v = (Vector *) VectorArrayGet(trainSamples, i);
++			Vector	   *v = (Vector *) VectorArrayGet(rotatedSamples, i);
 +			uint8		encoded[HNSW_MAX_DIM];
 +
 +			Assert(opqstate->pq->m <= HNSW_MAX_DIM);
 +
-+			OPQEncodeVector(encoded, v, opqstate, &buildstate->support);
-+			OPQDecodeVector(decoded, encoded, opqstate);
++			/* Encode rotated vector directly with PQ (no rotation needed) */
++			HnswPQEncodeVector(encoded, PointerGetDatum(v), opqstate->pq, &buildstate->support, opqstate->pq->m);
++			HnswPQDecodeVector(PointerGetDatum(decoded), encoded, opqstate->pq, dim);
 +
 +			memcpy(&yData[i * dim], decoded->x, dim * sizeof(float));
 +		}
 +
++		/* Compute MSE in rotated space: rotatedSamples vs yData */
++		elog(DEBUG1, "%s iteration %d/%d: MSE = %.6f", logPrefix, iter + 1, rotationIters,
++			 ComputeMSE(rotatedSamples, yData, dim));
++
 +		/* Step 4: Procrustes update R = argmin ||Y - X * R^T|| */
-+		ProcrustesUpdate(xData, yData, n, dim, opqstate->r, cov, svdU, svdV);
++		ProcrustesUpdate(xData, yData, n, dim, opqstate->r, cov, svdU, svdV, svdWs);
 +
 +		/* Reset rotated samples to original for next iteration */
 +		for (int i = 0; i < n; i++)
@@ -1892,6 +2065,7 @@ index 0000000..cba1ac8
 +	pfree(cov);
 +	pfree(svdU);
 +	pfree(svdV);
++	FreeSvdState(svdWs);
 +	pfree(decoded);
 +	VectorArrayFree(rotatedSamples);
 +
@@ -2039,10 +2213,8 @@ index 0000000..cba1ac8
 +	if (pqstate == NULL)
 +		return;
 +
-+	for (int i = 0; i < pqstate->m; i++)
-+		VectorArrayFree(pqstate->centroids[i]);
-+	if (pqstate->centroids)
-+		pfree(pqstate->centroids);
++	FreePQCentroids(pqstate);
++
 +	if (pqstate->subvectorBuffer)
 +		pfree(pqstate->subvectorBuffer);
 +
