@@ -3,7 +3,7 @@
 This document describes a patch for pgvector v0.8.0 that adds a two-stage Product Quantization (PQ) design to HNSW to achieve
 (1) traversal-time pruning using compact neighbor metadata and (2) element payload compression via residual PQ.
 The goal is to reduce random I/O and distance computations while controlling index size growth.
-This design is based on a re-ranking strategy proposed in [1].
+This design is based on a vector encoding strategy proposed in [1].
 
 ## Summary
 
@@ -99,5 +99,5 @@ while curbing index-size growth arising from per-neighbor metadata.
 
 ## References
 
- - [1] Hervé Jégou, Romain Tavenard, Matthijs Douze, and Laurent Amsaleg. 2011. Searching in one billion vectors: Re-rank with source coding. In Proceedings of the 2011 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP 2011). IEEE, 861–864. https://doi.org/10.1109/ICASSP.2011.5946540.
+ - [1] M. Douze, A. Sablayrolles and H. Jégou, "Link and Code: Fast Indexing with Graphs and Compact Regression Codes," 2018 IEEE/CVF Conference on Computer Vision and Pattern Recognition, Salt Lake City, UT, USA, 2018, pp. 3646-3654, doi: 10.1109/CVPR.2018.00384.
  - [2] A patch to improve the pgvector implementation of HNSW indices with candidate pruning for minimizing disk block accesses, https://github.com/maropu/pgvector_hnsw_candidate_pruning_patch.
